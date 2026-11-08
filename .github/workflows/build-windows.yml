@@ -1,0 +1,46 @@
+# Cross-builds the Windows driver and apps (scripts/build-windows.sh) and uploads
+# dist/openhouse-windows-x64.zip as the run's artifact.
+name: Build Windows
+
+on:
+  push:
+    branches: [windows-room]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++-mingw-w64-x86-64-posix gcc-mingw-w64-x86-64-posix binutils-mingw-w64-x86-64 ninja-build cmake zip
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+
+      - name: OpenVR driver header
+        run: |
+          mkdir -p "$RUNNER_TEMP/openvr"
+          curl -fsSL -o "$RUNNER_TEMP/openvr/openvr_driver.h" \
+            https://raw.githubusercontent.com/ValveSoftware/openvr/master/headers/openvr_driver.h
+
+      - name: vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-mingw-${{ hashFiles('vcpkg.json', 'cmake/triplets/**') }}
+          restore-keys: vcpkg-mingw-
+
+      - name: Build
+        env:
+          OPENVR_INCLUDE_DIR: ${{ runner.temp }}/openvr
+          VCPKG_MAX_CONCURRENCY: 4
+        run: bash scripts/build-windows.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openhouse-windows-x64-${{ github.sha }}
+          path: dist/openhouse-windows-x64/
