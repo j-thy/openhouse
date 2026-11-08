@@ -108,7 +108,7 @@ Four LH1 bases on lhbs multi-station: slots 1-4 = E236DC40 (master), A101B835, D
 "calibration-rescue-244" firmware and restored from a flash backup: **never suggest that
 firmware**. Devices: Index controllers (LHR-13DA81D1 right, LHR-8F9BE6F2 left), trackers,
 a Vive headset (LHR-0704E07A). Quest Pro through WiVRn for VRChat.
-Alignment tools can read the room from `/openhouse-room-<uid>` (`include/lh/room_shm.h`;
+Alignment tools can read the room from `/openhouse-room-<uid>` on Linux or `Local\openhouse-room` on Windows (`include/lh/room_shm.h`;
 copies of that header in other projects must stay identical).
 
 ## State of the work (2026-11-08)

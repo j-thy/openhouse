@@ -164,7 +164,7 @@ switches were removed for the release). Details and numbers are in `tracking_imp
     - A knocked origin that the room re-placed moves the anchor with it.
   - `LH_HOST_FRAME=steamvr`: align to SteamVR's universe through a shared base
     (`RawAlignment`), as the original did.
-- **RoomPublisher:** shared memory `/openhouse-room-<uid>` (Linux; layout in
+- **RoomPublisher:** shared memory `/openhouse-room-<uid>` (Linux) or `Local\openhouse-room` (Windows; layout in
   `include/lh/room_shm.h`). It carries every base's pose in the host frame, with
   σ and an origin flag, a *settled* flag (no base moving, all σ < 5 mm) and an *epoch*
   that changes when the settled room differs. Alignment tools can use it instead of the
