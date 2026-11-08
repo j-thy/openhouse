@@ -171,7 +171,7 @@ switches were removed for the release). Details and numbers are in `tracking_imp
     otherwise it is its own universe in the pinned frame above, and is written into
     `lighthousedb.json` (`"openhouse": true`, never imported back) so Room Setup has a
     universe to save to. Without it SteamVR asked for Room Setup on every start.
-- **RoomPublisher:** shared memory `/openhouse-room-<uid>` (Linux; layout in
+- **RoomPublisher:** shared memory `/openhouse-room-<uid>` (Linux) or `Local\openhouse-room` (Windows; layout in
   `include/lh/room_shm.h`). It carries every base's pose in the host frame, with
   σ and an origin flag, a *settled* flag (no base moving, all σ < 5 mm) and an *epoch*
   that changes when the settled room differs. Alignment tools can use it instead of the

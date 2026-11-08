@@ -11,6 +11,11 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#elif defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #endif
 
 namespace lh::openvr {
@@ -55,6 +60,13 @@ void RoomPublisher::Close() {
     munmap(shm_, sizeof *shm_);
     shm_unlink(path_.c_str());
   }
+#elif defined(_WIN32)
+  if (shm_) {
+    shm_->beat = 0;
+    UnmapViewOfFile(shm_);
+  }
+  if (map_) CloseHandle(static_cast<HANDLE>(map_));
+  map_ = nullptr;
 #endif
   shm_ = nullptr;
   failed_ = false;
@@ -76,6 +88,20 @@ bool RoomPublisher::Open() {
   shm_->magic = OPENHOUSE_ROOM_MAGIC;
   shm_->version = OPENHOUSE_ROOM_VERSION;
   shm_->pid = int32_t(getpid());
+  return true;
+#elif defined(_WIN32)
+  if (shm_ || failed_) return shm_ != nullptr;
+  HANDLE h = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(sizeof(openhouse_room)),
+                                OPENHOUSE_ROOM_WIN_NAME);
+  if (!h) { failed_ = true; return false; }
+  void* m = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(openhouse_room));
+  if (!m) { CloseHandle(h); failed_ = true; return false; }
+  map_ = h;
+  shm_ = static_cast<openhouse_room*>(m);
+  std::memset(shm_, 0, sizeof *shm_);
+  shm_->magic = OPENHOUSE_ROOM_MAGIC;
+  shm_->version = OPENHOUSE_ROOM_VERSION;
+  shm_->pid = int32_t(GetCurrentProcessId());
   return true;
 #else
   return false;
@@ -120,14 +146,18 @@ void RoomPublisher::Publish(const SessionSnapshot& snapshot, const Eigen::Isomet
       pendingLog_ = text + e;
     }
   }
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
   if (!Open()) return;
   auto* seq = reinterpret_cast<volatile uint32_t*>(&shm_->seq);
   __atomic_store_n(&shm_->seq, *seq + 1, __ATOMIC_RELEASE);
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#ifdef _WIN32
+  shm_->beat = double(GetTickCount64()) / 1000.0;
+#else
   timespec ts{};
   clock_gettime(CLOCK_MONOTONIC, &ts);
   shm_->beat = double(ts.tv_sec) + 1e-9 * double(ts.tv_nsec);
+#endif
   shm_->epoch = settle_.epoch();
   shm_->settled = settled;
   std::snprintf(shm_->room, sizeof shm_->room, "%s", snapshot.roomId.c_str());
