@@ -1,6 +1,7 @@
-/* Timebase (stock timebase.c). Phase 2: internal master only - one reference
- * edge per period on CT32B1 MR1. Optical slave sync arrives in phase 3; cable
- * sync is not supported (purely optical design). */
+/* Timebase (stock timebase.c): one reference edge per period on CT32B1 MR1, or
+ * from a master: optically (slave-optical, multi) or over the 3.5 mm sync cable
+ * (slave-cable, which falls back to optical without one). A, b and c drive the
+ * sync cable output like stock; multi leaves it undriven. */
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
@@ -21,6 +22,7 @@ bool timebase_permits_emission(void);
 void timebase_supervisor(void);         /* every 500 ms */
 void timebase_exit_standby(void);
 void timebase_select_input(void);       /* call after a channel change */
+void timebase_poll_cable(void);         /* every 10 ms: watch the cable while optical */
 void timebase_mask_own(bool masked);    /* hide own flashes/sweeps from the receiver */
 const char *timebase_corr_state(void);
 uint32_t timebase_pulses_seen(void), timebase_pulses_used(void), timebase_last_width(void);

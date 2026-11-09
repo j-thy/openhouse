@@ -53,11 +53,11 @@ GPIO pins are encoded in the firmware as `(port<<5)|bit`, IOCON function in bits
 |---|---|---|---|
 | P0_1 | in, pull-up | **Mode button**, active low, both-edge PIN_INT → `button_event` @0x3430. Also the **ROM ISP strap** | `board_init` @0xD8F8 **[C]** |
 | P0_3 | in | USB_VBUS (func 1) | `main` **[C]** |
-| P0_12 | in | CT32B1_CAP0 (func 3) — timebase capture source A | `timebase_select` @0xCBA8 **[C]**; cable vs optical **[I]** |
-| P1_4 | in | CT32B1_CAP0 (func 1) — timebase capture source B | same; selected when `P1_15` set **[C]** |
-| P1_15 | out | timebase input select (set ↔ P1_4, clear ↔ P0_12) | **[C]** code, meaning **[I]** |
-| P0_14 | out | CT32B1_MAT1 — set at each timebase sync, cleared at MR3 → **sync out** (3.5 mm cable) | `timebase_init` @0xCAAC **[I]** |
-| P1_0 | out | **sync-emission gate**: set at each timebase slot if this station emits | `timebase_mr1_isr` @0xCC8C **[I]** |
+| P0_12 | in | CT32B1_CAP0 (func 3) — **3.5 mm sync cable in** | `timebase_select` @0xCBA8 **[C]**; cable confirmed on hardware (log 2026-11-08) |
+| P1_4 | in | CT32B1_CAP0 (func 1) — optical sync receiver | same; selected when `P1_15` set **[C]** |
+| P1_15 | out | timebase input select (set ↔ P1_4 optical, clear ↔ P0_12 cable) | **[C]** code and hardware |
+| P0_14 | out | CT32B1_MAT1 — set at each timebase edge (MR1), cleared at MR3 → **sync out** (3.5 mm cable) | `timebase_init` @0xCAAC; an lhbs master's pulses received by an lhbs slave (log 2026-11-08) |
+| P1_0 | out | Stock, at every MR1 (`timebase_mr1_isr` @0xCD36): set as **master**, cleared as **slave-cable**, as **slave-optical** the permits-emission flag (0x1000066D). Gates a master's flash (log 2026-10-18); doesn't gate a slave's (MULTISTATION log 2026-10-19). Raised on a slave with the sync cable in, the slave's cable input reads stuck high from an OOTX frame boundary until P1_0 goes low; held high, it stays stuck (log 2026-11-08). Not the slave's own MAT1 (same with sync out undriven) | **[C]** code; effect measured (log 2026-11-08); a latch in the jack circuit, armed by P1_0, **[I]** |
 | P0_18 | out | CT32B0_MAT0 — set on MR0 = rotor-index capture + OOTX pulse width → **sync pulse end** | `rotor_init` @0xB988, `rotor_index_isr` @0xB720 **[I]** |
 | P0_20 | out | carrier oscillator enable | `carrier_init` @0x36B8 **[C]** |
 | P1_28 | in, hyst | CT32B0_CAP0 — **rotor 0 index** sensor | **[C]** |
@@ -129,9 +129,11 @@ main @0xA52C
    * programs CT32B0 MR0 = capture + width → P0_18 marks the end of the sync flash,
    * computes laser on/off match times from the measured period and the per-rotor event list
      (`laser.N.start`, `laser.N.length` in degrees) and arms CT32B0 MR1/MR2.
-3. **Timebase MR1** (`timebase_mr1_isr` @0xCC8C) fires every half slot, re-arms itself
-   (`period/2 ± 100 000` ticks in TDM modes), raises P1_0 when this station is the emitter in
-   that slot and P0_14 (sync out), and feeds the rotor PLL references.
+3. **Timebase MR1** (`timebase_mr1_isr` @0xCC8C) fires every half slot and re-arms itself.
+   The match raises P0_14 (sync out); MR3 is set `period/2` later to end that pulse
+   (`± 100 000` ticks by the skip flag in master-tdm, opposite sign in slave-optical).
+   It sets P1_0 as master, clears it as slave-cable and copies permits-emission to it as
+   slave-optical, and feeds the rotor PLL references.
 
 The sync flash therefore starts on the rotor index edge and ends at MR0. That gives
 sub-tick alignment between optical sweep and sync **[I — hypothesis: hardware gating of P1_0 /
@@ -226,7 +228,10 @@ valid. Running firmware can also jump into ISP: stock `isp` console command; cus
 ## 7. Open questions (to verify on hardware)
 
 1. ~~Sync-LED gating~~ resolved (see log): index edge starts, P0_18 ends, P1_0 gates.
-2. Which of P0_12 / P1_4 is the 3.5 mm cable input and which is the optical sync photodiode.
+2. ~~Which of P0_12 / P1_4 is the 3.5 mm cable input~~ resolved (see log): P0_12 cable, P1_4 optical.
+   Narrowed (log 2026-11-08): with P1_0 high a cable slave's input latches high from an OOTX frame
+   boundary until P1_0 drops. Still open: what sets it there (not the flash data; either base's frame
+   boundary fits, the two stay in step). Needs the schematic or a scope on the jack.
 3. Coarse vs fine motor PWM (CT16B1 vs CT16B0) and the motor driver IC.
 4. ~~P0_23, P1_5~~ resolved (emitter power, pulse stretch). P0_17, P0_19 still unknown (stock never reads P0_19).
 5. UART is wired to the Bluetooth chip, which uses stock's console for power management (see log).
@@ -264,3 +269,6 @@ valid. Running firmware can also jump into ISP: stock `isp` console command; cus
 | 2026-10-18 | lhbs optical slave (channel c) locks to a stock master (channel b, E236DC40): correlator locked, phase err ~5 us, rotors locked to master. Original SteamVR disambiguator pairs both bases in TDM (A101B835 + E236DC40, equal frame counts, 0 jitter). Optical receiver = P1_4 (CT32B1 CAP0, both edges) with P1_15 high; classifier table @0x11EDC; slave offset = timebase.optical.offset 20000 ticks = 1/2400 s. lhbs adds a guard against a correction scheduling MR1 in the past (seen once, cause not yet identified). |
 | 2026-10-18 | Bluetooth power management: separate Broadcom BLE chip (GATT: vendor service 0000cb00/char cb01 = power control, plus a WICED OTA service 9e5d1e47-... that must not be written). A 20-byte write 12 <00 wake/02 sleep> <u16> <base ID u32 LE> 00*12 to cb01 makes the BLE chip type 'param set sys.standby 0/1' (and 'param get sys.standby', expecting 'sys.standby\t<true|false>\r\n') into the main MCU's UART console (P1_26/P1_27, 115200). lhbs implements that console subset; tools/lhpower.py does sleep/wake from Linux (verified on lhbs and stock). |
 | 2026-10-18 | Open: remote ISP re-entry after lhbs USB use fails (ROM USB drive times out); manual button entry works. Boot ROM writes 0x3456ABCD near top of SRAM0 on reset |
+| 2026-11-08 | Sync cable, two HTC 1.0 bases on lhbs with this cable support (slave on A, master on b, the 3.5 mm sync cable between them). v1.0.1 lhbs ignored the cable: A covered with the cable in went purple. Stock cable protocol read from the stock image (`timebase_capture_isr` @0xC8B0, `timebase_mr1_isr` @0xCC8C): one pulse per period, rising at the master's edge, falling `period/2` later (`± 100 000` ticks in master-tdm by the skip flag); a slave locks on two rises `period ± 10 000` apart and reads `width <= half + 50 000` as "sweep". With it: the slave receives the master's pulses on P0_12 at exactly 300092/500092 ticks. While emitting with P1_0 high it lost the lock for ~11 periods once per OOTX frame (every 179 periods = 358 bits); 0 losses with `sync off`, unchanged with `laser off` or uncovered; with P1_0 low on the cable, as stock: 0 losses and 0 stray edges in ~10 000 periods covered, two captures per pulse, the slave still flashing. Fallback to optical on unplugging, back to the cable from an optical lock on replugging, a bare jack idle at one level (no cable tries in 60 s while optically locked; since then a try needs a toggling pin in every state) |
+| 2026-11-08 | Sync cable, stock and lhbs mixed (`lhcapture --check`, Vive tracker): lhbs master on b + stock slave on A, and stock master on b + lhbs slave on A, both `stock 2-station (417 us)` with each base sweeping 1/2 in separate revolutions. Stock master covered: the lhbs slave alone (`one station`) keeps flashing and sweeping 1/2, so it holds the stock master's cable pulse. Stock's receiver takes the lhbs half-period pulse (it has no optical fallback on A) |
+| 2026-11-08 | P1_0 on a cable slave (debug build, slave on A uncovered, lhbs master on b): with P1_0 high, the slave's cable pin reads high throughout each dropout (polled every 10 ms: never low) and nothing is captured; dropouts start at OOTX bit 0-4 of the slave's frame, the same with every bit forced to 0 or to 1 (~1 per 3-5 s each), and with the slave's own sync out undriven. P1_0 forced high even after a loss: the slave never relocks on the cable. With P1_0 low (the fix): 0 dropouts |

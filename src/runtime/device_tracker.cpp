@@ -174,8 +174,20 @@ void DeviceTracker::HandleFrame(const OpticalFrame& original) {
       int& streak = rejectStreak_[{frame.baseSerial, frame.axis & 1}];
       if (filter_->LastOpticalTime() == lastOpticalBefore) ++refusedLit_;
       else refusedLit_ = 0;
-      if (filter_->Filter().rejectCount != rejectsBefore) ++streak;
-      else if (filter_->LastOpticalTime() != lastOpticalBefore) {
+      if (filter_->Filter().rejectCount != rejectsBefore) {
+        ++streak;
+        // Say why the light is being refused, once per streak. Without this a log can
+        // only report "keeps rejecting" (report 2026-11-09: 1092 reacquires in 399 s,
+        // and nothing to distinguish a bad calibration from a reflection from a moved
+        // base). The limits themselves are unchanged; only the reason is recorded.
+        if (streak == kRejectStreak) {
+          const auto& f = filter_->Filter();
+          char text[200];
+          std::snprintf(text, sizeof text, "base %08X: %d well-lit frames rejected in a row (%s, %d sensor rows)",
+                        frame.baseSerial, streak, direct::RejectReasonName(f.lastRejectReason), f.lastRejectRows);
+          Log(text);
+        }
+      } else if (filter_->LastOpticalTime() != lastOpticalBefore) {
         streak = 0;
         if (rejectStreak_[{frame.baseSerial, (frame.axis & 1) ^ 1}] == 0) disagreeing_[frame.baseSerial] = 0;
       }

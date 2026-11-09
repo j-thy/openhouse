@@ -34,3 +34,4 @@ lhr-*/
 !tests/data/captures/**
 
 lighthousedb.json
+*room.json

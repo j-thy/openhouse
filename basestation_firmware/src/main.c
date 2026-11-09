@@ -135,7 +135,7 @@ int main(void)
     uint32_t t10 = 0, t100 = 0, t500 = 0;
     for (;;) {
         uint32_t now = sys_ms();
-        if (now - t10 >= 10)   { t10 = now;  accel_task(); }
+        if (now - t10 >= 10)   { t10 = now;  accel_task(); timebase_poll_cable(); }
         if (now - t100 >= 100) { t100 = now; ui_task(); laser_poll(); multi_task(); }
         if (now - t500 >= 500) { t500 = now; carrier_task(); timebase_supervisor(); }
 

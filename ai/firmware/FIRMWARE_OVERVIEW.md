@@ -57,7 +57,7 @@ alone.
 | `sys.c`, `startup.c`, `lpc11u.h`, `board.h` | Clocks, vectors, registers, pin map |
 | `params.c`, `params_table.h` | The parameter store: every stock parameter, default and EEPROM layout, loaded and saved in stock format |
 | `modes.c` | Channels: the stock mode table (A master, b and c slaves), the button cycle `A b c 1 2 3 4`, applying a channel |
-| `timebase.c` | The heart: one edge per revolution on CT32B1, skip/axis decisions, the optical slave (correlator + phase loop), emission control, standby |
+| `timebase.c` | The heart: one edge per revolution on CT32B1, skip/axis decisions, the optical slave (correlator + phase loop), the sync cable, emission control, standby |
 | `rotor.c` | Rotor speed control: coarse PWM, the DPLL to the timebase, lock detection, kick and fault on stall |
 | `laser.c` | The ISL58303, per-turn laser on/off windows, power regulation (APC) from the photodiode, and the safety layers |
 | `ootx.c` | Builds and encodes the OOTX frame (double buffered), one bit per flash; refreshes the accelerometer in it |
@@ -109,8 +109,19 @@ alone.
 - **lhbs fix:** while searching in multi mode, the correlator only looks at the first
   flash of each group, which is the master's. Stock logic took any two back-to-back
   flashes one period apart, which never happens once other slaves are flashing.
+- **Sync cable (lhbs, as stock):** channels A, b and c drive the jack (P0_14, CT32B1 MAT1): a
+  pulse rising at each edge, falling `period/2` later, `± 100 000` ticks by the skip
+  flag in master-tdm (opposite sign in slave-optical); multi leaves P0_14 undriven, as
+  v1.0.1 did (no multi station listens, and all of them raise P1_0). Channel `A` (slave-cable)
+  listens on P0_12 first: two rises one period apart lock it, the rises drive the
+  rotors and the width sets sweep/skip. Locked, only edges that fit the signal count
+  (rises at 1–9 periods, the three widths stock sends). A loss gives the cable 2 s to
+  come back, then it follows optically; it goes back to the cable only when the pin
+  (sampled every 10 ms) toggles, even from an optical lock. Tries that find no lock back
+  off from 5 s to 60 s. A cable slave keeps P1_0 low, as stock does for slave-cable:
+  raised, it corrupts its own cable input. `corr` shows the cable state.
 - **Emission permission:** a slave flashes only while locked and holding the phase
-  (within 20 µs). A master always may.
+  (within 20 µs), or locked to the cable. A master always may.
 - **Standby:** with no permission for 60 s, the base goes to standby. Rotors and lasers
   stop, the display goes dark and LED1 is green. Stock wakes only on the button or
   Bluetooth. **lhbs:** a slave keeps listening and wakes by itself once it locks onto a
@@ -212,7 +223,7 @@ and the worst case (a device seeing only one base) is 60/N Hz.
 | `params [pattern]`, `get`, `set`, `save` | Parameters, in RAM and saved to EEPROM in stock format |
 | `rotor`, `watch` | Rotor PLL and lock |
 | `laser`, `laser on/off`, `apc on/off` | Laser driver, power, current, FAULT (`laser on` acknowledges a fault) |
-| `corr` | Slave correlator state and phase trace |
+| `corr` | Slave correlator state, cable state (input, lock, losses, stray edges) and the trace |
 | `multi ...` | The round, seen slots, decoded frames and relocks, guard, superframe confirms and realigns; `enable`, `slot`, `policy`, `off` |
 | `ootx`, `eeprom`, `uartlog` | OOTX frame, EEPROM hex dump, Bluetooth UART traffic |
 | `isp`, `reset` | Reboot into the USB bootloader, or reboot |

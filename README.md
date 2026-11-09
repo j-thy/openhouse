@@ -46,7 +46,8 @@ cd openhouse-driver
 If SteamVR is somewhere unusual, set `STEAMVR_DIR` before running it. The tracking visualizer needs `glfw` installed.
 
 ### 1.0 basestation firmware (lhbs)
-This is only needed if you want to use more than 2 1.0 basestations. lhbs keeps everything the original firmware does (A/b/c channels, sync cable), and adds a multi-station mode for up to 4 basestations.
+#### **THIS IS ONLY NEEDED IF YOU OWN 1.0 BASESTATIONS AND WANT TO USE MORE THAN TWO OF THEM AT THE SAME TIME. DO NOT FLASH THIS ON 2.0 BASESTATIONS!!!!!!!** 
+lhbs keeps everything the original firmware does (A/b/c channels, sync cable), and adds a multi-station mode for up to 4 basestations.
 
 Get `openhouse-basestation-firmware.zip`, extract it, and:
 - **Windows:** double click `Install-Firmware.bat`

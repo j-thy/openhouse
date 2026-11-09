@@ -126,6 +126,9 @@ Released as openhouse 1.0. Recent work, all in the tree:
 * Preinit devices (`~/.config/lh/preinit`) are reported connected-but-uninitialized until
   they first connect (Monado only takes devices at startup).
 * The pairing mailbox logs every request and reply (`pairing:` lines in vrserver.txt).
+* lhbs sync cable (A/b/c) as stock: A, b and c drive the jack, A locks to it first and
+  falls back to optical without one, multi leaves the jack undriven. A cable slave keeps
+  P1_0 low. `ai/firmware/FIRMWARE_OVERVIEW.md` §5, `HARDWARE.md` log 2026-11-08.
 
 Open:
 * A friend's Windows PC with no headset shows the pairing page stuck on "Initializing"

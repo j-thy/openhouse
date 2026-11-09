@@ -125,35 +125,41 @@ void DirectFilter::Predict(double dtPos, double dtRot) {
   Ppred = F * P.topLeftCorner(n, n) * F.transpose() + Q.topLeftCorner(n, n);
 }
 
-bool DirectFilter::RejectCorrection(const Vec& dx) const {
+bool DirectFilter::RejectCorrection(const Vec& dx) {
+  // Same limits, same order of test: only the reason is recorded (see RejectReason).
+  const auto refuse = [this](int reason) {
+    lastRejectReason = reason;
+    return true;
+  };
   for (int i = 0; i < dx.size(); i++)
-    if (std::isnan(dx[i] - dx[i])) return true;
+    if (std::isnan(dx[i] - dx[i])) return refuse(kRejectNaN);
   auto d = [&](int i) { return i < dx.size() ? dx[i] : 0.0; };
   const double rot = std::sqrt(d(30) * d(30) + d(28) * d(28) + d(29) * d(29));
-  if (kMaxImuRot < rot) return true;
+  if (kMaxImuRot < rot) return refuse(kRejectImuRot);
   bool skipTilt = false;
   if (updateCount < 0x105) {
-    if (kMaxGravMag < std::fabs(d(18))) return true;
+    if (kMaxGravMag < std::fabs(d(18))) return refuse(kRejectGravMag);
     if (updateCount < 0xc9) skipTilt = true;
   } else {
-    if (kMaxImuRotConverged < rot) return true;
+    if (kMaxImuRotConverged < rot) return refuse(kRejectImuRot);
     const double g = std::fabs(d(18));
-    if (kMaxGravMag < g) return true;
-    if (kMaxGravMagConverged < g) return true;
+    if (kMaxGravMag < g) return refuse(kRejectGravMag);
+    if (kMaxGravMagConverged < g) return refuse(kRejectGravMag);
   }
   if (!skipTilt && kMaxGravTilt < std::sqrt(d(16) * d(16) + d(17) * d(17))) {
-    return true;
+    return refuse(kRejectGravTilt);
   }
   const double w2 = d(13) * d(13) + d(14) * d(14) + d(15) * d(15);
-  if (omegaCorrectionLimit2 <= w2) return true;
+  if (omegaCorrectionLimit2 <= w2) return refuse(kRejectOmega);
   for (int s = 0; s < 3; s++) {
     if (!altBaseActive[s]) continue;
     const int k = kAltBaseIndex[s];
     const double trans = std::sqrt(d(k + 2) * d(k + 2) + d(k) * d(k) + d(k + 1) * d(k + 1));
-    if (kMaxAltBaseTrans < trans) return true;
+    if (kMaxAltBaseTrans < trans) return refuse(kRejectAltBaseTrans);
     const double rotAlt = std::sqrt(d(k + 5) * d(k + 5) + d(k + 3) * d(k + 3) + d(k + 4) * d(k + 4));
-    if (kMaxAltBaseRot < rotAlt) return true;
+    if (kMaxAltBaseRot < rotAlt) return refuse(kRejectAltBaseRot);
   }
+  lastRejectReason = kRejectNone;
   return false;
 }
 
@@ -217,10 +223,11 @@ bool DirectFilter::Update(const std::vector<Residual>& res, const Mat& R, const 
     // sensor 0.24 rad off moved it 43 cm, 1 m within 0.3 s). Frames of fewer than three
     // sensor rows are rejected. (A chi-square gate doesn't tell them apart: the
     // predicted spread is far too small in violent motion, median 71 per row.)
-    const int optical = m - (res.empty() ? 0 : res.back().m);
-    if (optical < 3) {
+    if (opticalRows < 3) {
       flags |= 0x200;
       rejectCount++;
+      lastRejectReason = kRejectFewRows;
+      lastRejectRows = opticalRows;
       return false;
     }
   }
@@ -256,6 +263,7 @@ bool DirectFilter::Update(const std::vector<Residual>& res, const Mat& R, const 
   if (RejectCorrection(dx)) {
     flags |= 0x200;
     rejectCount++;
+    lastRejectRows = opticalRows;
     return false;
   }
   // Not stock: one frame that disagrees with the prediction as a whole and would throw the

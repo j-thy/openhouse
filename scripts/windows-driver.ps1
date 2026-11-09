@@ -31,8 +31,12 @@ if ($Action -eq 'Status') {
     Write-Output "Stock backup present: $(Test-Path $backup)"
     exit 0
 }
-if (Get-Process -Name vrserver,monado-service -ErrorAction SilentlyContinue) {
-    throw 'Stop SteamVR / Monado before changing the driver.'
+# Steam holds SteamVR's driver DLL open even when SteamVR itself is not running: with
+# it up, replacing the file fails with "Cannot create a file when that file already
+# exists". Check the whole chain, and name what to close.
+$hosts = @(Get-Process -Name steam,vrserver,vrmonitor,vrcompositor,monado-service -ErrorAction SilentlyContinue)
+if ($hosts) {
+    throw "Stop $($hosts.ProcessName -join ', ') before changing the driver (Steam loads SteamVR's driver DLL too)."
 }
 # The update check (openhouse-check.exe): an app SteamVR starts with every session that
 # warns when a SteamVR update replaced this driver. Registered in Steam's config:
@@ -118,7 +122,12 @@ if ($Action -eq 'Install') {
     exit 0
 }
 Copy-Item -LiteralPath $source -Destination "$target.new" -Force
-Move-Item -LiteralPath "$target.new" -Destination $target -Force
+try {
+    Move-Item -LiteralPath "$target.new" -Destination $target -Force
+} catch {
+    Remove-Item -LiteralPath "$target.new" -Force -ErrorAction SilentlyContinue
+    throw "Could not replace $target - a process still has it open. Close Steam and SteamVR completely, then run Install-Driver.bat again. ($($_.Exception.Message))"
+}
 if ((Get-FileHash $target).Hash -ne (Get-FileHash $source).Hash) { throw 'Installed file hash mismatch' }
 Install-Schema
 $checkExe = Join-Path $PSScriptRoot 'apps\openhouse-check.exe'

@@ -47,11 +47,40 @@ static void tb_trace(uint8_t kind, int32_t e, int32_t extra, uint32_t a, uint32_
     x->kind = kind; x->e = e; x->extra = extra; x->a = a; x->b = b;
 }
 
+/* ---- cable sync (stock timebase_capture_isr @0xC8B0, timebase_mr1_isr @0xCC8C).
+ * One pulse per period: rises at the master's edge, falls period/2 later,
+ * +-CABLE_TDM_WIDTH by the master's skip flag in TDM. ---- */
+#define PIN_CABLE_IN    PIN(0, 12)      /* CT32B1_CAP0 (func 3), selected with P1_15 low */
+#define PIN_CABLE_OUT   PIN(0, 14)      /* CT32B1_MAT1 (func 3) */
+#define CABLE_TOL       10000u          /* stock: rising edges one period +- this apart */
+#define CABLE_TDM_WIDTH 100000u         /* stock 0xCEE8 */
+#define CABLE_TDM_SPLIT 50000u          /* stock 0xCA74/0xCA78 */
+#define CABLE_WIDTH_TOL 20000u          /* lhbs: a width this close to one stock sends */
+#define CABLE_LOST_PERIODS 10u          /* stock: periods without a good rise -> lost */
+#define CABLE_LISTEN_MS 2000u           /* lhbs: unlocked this long on the cable -> optical */
+#define CABLE_RETRY_MS  5000u           /* lhbs: minimum time on optical before a cable try */
+#define CABLE_BACKOFF_MAX 12u           /* lhbs: cap on the retry wait, x CABLE_RETRY_MS */
+static volatile bool cable_in;          /* CAP0 on the cable (else the photodiode) */
+static volatile bool cable_locked;
+static volatile bool cable_tdm = true;  /* from the last width, applied at the next rise */
+static volatile uint32_t cable_rise, cable_good, cable_edges, cable_lost_count;
+static volatile uint32_t cable_stray_rises, cable_stray_falls, cable_caps;
+static uint32_t input_since_ms;
+static uint8_t cable_levels;            /* while optical: 1 = P0_12 seen low, 2 = high */
+static uint8_t cable_misses;            /* cable tries without a lock, since the last lock */
+
 static bool slave_mode(void)
 {
-    /* cable sync is dropped by design: slave-cable channels follow optically too */
     return P.timebase_mode == TB_SLAVE_OPTICAL || P.timebase_mode == TB_SLAVE_CABLE;
 }
+
+static bool cable_mode(void)
+{
+    return P.timebase_mode == TB_SLAVE_CABLE && !multi_active();
+}
+
+/* console `set` can change the mode without a reselect: trust the mode */
+static bool on_cable(void) { return cable_in && cable_mode(); }
 
 /* stock classifier table @0x11EDC: width (48 MHz ticks) -> pulse type, tol 250 */
 static int classify(uint32_t w)
@@ -72,6 +101,9 @@ static void capture_irq(bool on)
 /* stock cc64: mask our own emissions from the receiver (slave + optical.mask) */
 void timebase_mask_own(bool masked)
 {
+    /* Called from CT32B0, which preempts CT32B1: capture_irq's IR clear would drop a
+     * latched cable edge, and the cable can't see our light anyway. */
+    if (on_cable()) return;
     if (!slave_mode() || !P.timebase_optical_mask) masked = false;
     capture_irq(!masked);
 }
@@ -234,35 +266,187 @@ static void optical_edge(uint32_t t)
         corr_pulse(rise_t, type <= 5, first);
 }
 
-/* stock timebase_select_input @0xCBA8: optical receiver for slave modes */
-void timebase_select_input(void)
+/* Locked, the cable's rises replace MR1 as the rotors' reference (stock: MR1 then
+ * only watches for loss). Unlike stock, an edge that doesn't fit the signal is
+ * counted as stray and ignored, so a glitch can't move the reference. */
+static void cable_edge(uint32_t t)
+{
+    const uint32_t per = P.timebase_period ? P.timebase_period : 800000;
+    const uint32_t half = per >> 1;
+    if (!gpio_read(PIN_CABLE_IN)) {
+        /* the three widths stock sends: half, half -+ CABLE_TDM_WIDTH */
+        const uint32_t w = t - cable_rise;
+        const int32_t d = (int32_t)(w - half);
+        const int32_t off = d < 0 ? -d : d;
+        if (off > (int32_t)CABLE_WIDTH_TOL &&
+            (off < (int32_t)(CABLE_TDM_WIDTH - CABLE_WIDTH_TOL) ||
+             off > (int32_t)(CABLE_TDM_WIDTH + CABLE_WIDTH_TOL))) {
+            cable_stray_falls++;
+            tb_trace('W', (int32_t)w, 0, t, cable_rise);
+            return;
+        }
+        last_width = w;
+        cable_tdm = w <= half + CABLE_TDM_SPLIT;
+        return;
+    }
+    const uint32_t dt = t - cable_rise;
+    const uint32_t k = (dt + half) / per;           /* whole periods since the last rise */
+    const int32_t err = (int32_t)(dt - k * per);
+    const bool fits = cable_locked ? k >= 1 && k < CABLE_LOST_PERIODS : k == 1;
+    if (!fits || err > (int32_t)CABLE_TOL || err < -(int32_t)CABLE_TOL) {
+        if (cable_locked) {                         /* noise: keep the reference */
+            cable_stray_rises++;
+            tb_trace('R', (int32_t)dt, 0, t, cable_rise);
+            return;
+        }
+        cable_rise = t;                             /* maybe the first of a new train */
+        return;
+    }
+    if (k == 1) period_cur = dt;
+    cable_rise = t;
+    cable_good = t;
+    cable_edges++;
+    cable_locked = true;
+    tdm_flag = cable_tdm;
+    rotor_reference_edge(t, P.timebase_offset);
+    rotor_control();
+}
+
+/* Only one pin may be CT32B1_CAP0; the other goes back to GPIO. FUNC is changed
+ * read-modify-write, as stock does: P0_12's ADMODE bit must stay digital. */
+static void route_capture(bool cable)
+{
+    lpc_timer_t *t = TMR_CT32B1;
+    t->CCR = 0;
+    if (cable) {
+        *iocon(PIN_OPT_IN) = IOCON_FUNC(0);
+        gpio_output(PIN_OPT_SEL, false);
+        *iocon(PIN_CABLE_IN) = (*iocon(PIN_CABLE_IN) & ~7u) | IOCON_FUNC(3) | (1u << 5);
+    } else {
+        *iocon(PIN_CABLE_IN) = (*iocon(PIN_CABLE_IN) & ~7u) | IOCON_FUNC(1);
+        gpio_output(PIN_OPT_SEL, true);
+        *iocon(PIN_OPT_IN) = IOCON_FUNC(1) | (1u << 5);   /* CT32B1_CAP0, hysteresis */
+    }
+    cable_in = cable;
+    input_since_ms = sys_ms();
+    t->IR = IR_CR(0);
+    t->CCR = CCR_RISE(0) | (2u << 0) | CCR_I(0);          /* both edges + irq */
+}
+
+/* Sync out, P0_14 as MAT1 (set by hardware at MR1, cleared at MR3), in A/b/c as stock.
+ * Multi doesn't use the cable and every multi station raises P1_0, so it leaves P0_14
+ * undriven: a cable left plugged in would otherwise have several drivers. */
+static bool sync_out_on;
+static void sync_out(bool on)
 {
     lpc_timer_t *t = TMR_CT32B1;
     uint32_t s = irq_save();
+    sync_out_on = on;
+    if (on) {
+        gpio_output(PIN_CABLE_OUT, false);
+        *iocon(PIN_CABLE_OUT) = (*iocon(PIN_CABLE_OUT) & ~7u) | IOCON_FUNC(3);
+        t->EMR = 2u << 6;           /* EMC1 = set on match */
+        if (t->MCR & MCR_I(1)) t->MCR |= MCR_I(3);  /* else timebase_start sets it */
+    } else {
+        t->MCR &= ~MCR_I(3);
+        t->EMR = 0;
+        t->IR = IR_MR(3);
+        *iocon(PIN_CABLE_OUT) = (*iocon(PIN_CABLE_OUT) & ~7u) | IOCON_FUNC(1);
+        GPIO_DIR(PIN_PORT(PIN_CABLE_OUT)) &= ~(1u << PIN_BIT(PIN_CABLE_OUT));
+    }
+    irq_restore(s);
+}
+
+static void reset_sync_state(void)
+{
     period_cur = P.timebase_period ? P.timebase_period : 800000;
     mr1_extra = 0;
     ph_f = ph_prev = ph_integ = 0;
     corr.n = 0; corr.sum_ms = 0; corr.est = 0;
+    cable_locked = false;
+    cable_tdm = true;
+}
+
+/* stock timebase_select_input @0xCBA8: optical receiver for slave modes, the cable
+ * for slave-cable (lhbs: the cable first, see cable_switch) */
+void timebase_select_input(void)
+{
+    lpc_timer_t *t = TMR_CT32B1;
+    sync_out(!multi_active());
+    uint32_t s = irq_save();
+    t->CCR = 0;                     /* no capture on the old input against reset state */
+    reset_sync_state();
+    cable_misses = 0;
     rev = 0;
     sf_confirm = 0;
     flash_rev = true;
     P.corr_status = CS_DISABLED;
     irq_restore(s);
     if (slave_mode() || multi_active()) {          /* a multi master listens for its slaves */
-        gpio_output(PIN_OPT_SEL, true);
-        *iocon(PIN_OPT_IN) = IOCON_FUNC(1) | (1u << 5);   /* CT32B1_CAP0, hysteresis */
-        t->CCR = CCR_RISE(0) | (2u << 0) | CCR_I(0);      /* both edges + irq */
-        if (slave_mode() && P.corr_status == CS_DISABLED) P.corr_status = CS_SEARCHING;
+        route_capture(cable_mode());
+        if (slave_mode() && !cable_in) P.corr_status = CS_SEARCHING;
     } else {
         gpio_output(PIN_OPT_SEL, false);
         t->CCR = 0;
-        P.corr_status = CS_DISABLED;
+        cable_in = false;
+        t->IR = IR_CR(0);
     }
-    t->IR = IR_CR(0);
+}
+
+/* Every 10 ms from the main loop, while optical (P0_12 is then a plain GPIO). A live
+ * cable is high 37-63 % of each period, and 10 ms samples walk across the 16.7 ms
+ * period, so both levels show within one supervisor interval; an idle jack holds one.
+ * Not done in timebase_supervisor: 500 ms is exactly 30 periods, the same phase each time. */
+void timebase_poll_cable(void)
+{
+    if (cable_mode() && !cable_in) cable_levels |= gpio_read(PIN_CABLE_IN) ? 2 : 1;
+}
+
+/* lhbs, slave-cable: unlocked on the cable for CABLE_LISTEN_MS (a loss restarts it),
+ * follow optically; back to the cable once its pin toggles, even from an optical lock.
+ * Failed tries back off, so a cable that toggles but never locks can't keep breaking
+ * the optical lock. */
+static void cable_switch(void)
+{
+    static uint32_t lost_seen;
+    const bool signal = cable_levels == 3;
+    cable_levels = 0;
+    if (!cable_mode()) return;
+    if (cable_lost_count != lost_seen) {
+        lost_seen = cable_lost_count;
+        input_since_ms = sys_ms();
+    }
+    const uint32_t held = sys_ms() - input_since_ms;
+    bool to_cable;
+    if (cable_in) {
+        if (cable_locked) { cable_misses = 0; return; }
+        if (held < CABLE_LISTEN_MS) return;
+        if (cable_misses < CABLE_BACKOFF_MAX) cable_misses++;
+        to_cable = false;
+    } else {
+        if (!signal) return;
+        uint32_t wait = CABLE_RETRY_MS;
+        for (uint8_t i = 1; i < cable_misses && wait < CABLE_BACKOFF_MAX * CABLE_RETRY_MS; i++)
+            wait *= 2;
+        if (wait > CABLE_BACKOFF_MAX * CABLE_RETRY_MS) wait = CABLE_BACKOFF_MAX * CABLE_RETRY_MS;
+        if (held < wait) return;
+        to_cable = true;
+    }
+    uint32_t s = irq_save();
+    TMR_CT32B1->CCR = 0;            /* no capture on the old input against reset state */
+    reset_sync_state();
+    P.corr_status = to_cable ? CS_DISABLED : CS_SEARCHING;
+    irq_restore(s);
+    route_capture(to_cable);
 }
 
 void timebase_dump_trace(void (*out)(const char *fmt, ...))
 {
+    out("cable: input %s  %s  edges %u  lost %u  failed tries %u  next %s\n",
+        cable_in ? "CABLE" : "optical", cable_locked ? "LOCKED" : "no signal",
+        cable_edges, cable_lost_count, cable_misses, cable_tdm ? "sweep" : "skip");
+    out("cable: stray rises %u  stray falls %u  captures %u  (trace: R rise, W width, L lost)\n",
+        cable_stray_rises, cable_stray_falls, cable_caps);
     out("guards %u, trace (oldest first): kind e extra a b\n", tb_guard_count);
     for (int i = 0; i < 16; i++) {
         tb_trace_t *x = &trace[(trace_pos + i) & 15];
@@ -289,6 +473,8 @@ static bool tdm_mode(void)
  * the correlator is locked to a master. */
 bool timebase_permits_emission(void)
 {
+    /* Stock lets a cable slave emit unlocked, colliding with the master; lhbs waits. */
+    if (on_cable()) return cable_locked;
     if (slave_mode())
         /* Not sf_confirm (that gates sweeping, multi_sweeps_now): a slave that stopped
          * flashing whenever the round changed under it dropped out of the master's
@@ -319,7 +505,7 @@ void timebase_init(void)
     t->TCR = 0;
     t->PR = 0;
     t->MCR = 0;
-    t->EMR = 0;                     /* sync-out MAT1 (P0_14) never driven: optical only */
+    t->EMR = 0;                     /* sync out: set per mode by timebase_select_input */
     t->CCR = 0;                     /* optical capture enabled in phase 3 */
     t->IR = 0xFF;
     period_cur = P.timebase_period ? P.timebase_period : 800000;
@@ -332,8 +518,8 @@ void timebase_start(void)
 {
     lpc_timer_t *t = TMR_CT32B1;
     t->MR[1] = t->TC + period_cur;
-    t->IR = IR_MR(1);
-    t->MCR = MCR_I(1);
+    t->IR = IR_MR(1) | IR_MR(3);
+    t->MCR = MCR_I(1) | (sync_out_on ? MCR_I(3) : 0);
     running = true;
 }
 
@@ -345,7 +531,11 @@ void CT32B1_IRQHandler(void)
     lpc_timer_t *t = TMR_CT32B1;
     uint32_t ir = t->IR;
     t->IR = ir;
-    if (ir & IR_CR(0)) optical_edge(t->CR[0]);
+    if (ir & IR_CR(0)) {
+        if (!cable_in) optical_edge(t->CR[0]);
+        else if (cable_mode()) { cable_caps++; cable_edge(t->CR[0]); }
+    }
+    if (ir & IR_MR(3)) t->EMR &= ~(1u << 1);   /* sync out pulse ends (stock MR3 isr @0xCA9C) */
     if (!(ir & IR_MR(1))) return;
     uint32_t now = t->MR[1];
     int32_t extra = mr1_extra;
@@ -358,11 +548,28 @@ void CT32B1_IRQHandler(void)
         next = t->TC + period_cur;
     }
     t->MR[1] = next;
-    tb_trace('E', 0, extra, now, next);
+    if (!cable_in) tb_trace('E', 0, extra, now, next);  /* on the cable: keep the ring for R/W/L */
     mr1_extra = 0;
-    if (slave_mode()) corr_tick(now);
+    {
+        /* sync out width, from the skip flag before it alternates below */
+        uint32_t w = period_cur >> 1;
+        if (!multi_active() && P.timebase_mode == TB_MASTER_TDM)
+            w = tdm_flag ? w + CABLE_TDM_WIDTH : w - CABLE_TDM_WIDTH;
+        else if (!multi_active() && P.timebase_mode == TB_SLAVE_OPTICAL)
+            w = tdm_flag ? w - CABLE_TDM_WIDTH : w + CABLE_TDM_WIDTH;
+        t->MR[3] = now + w;
+    }
+    /* signed: a cable edge handled in this same interrupt can be later than `now` */
+    if (cable_locked && (int32_t)(now - cable_good) > (int32_t)(CABLE_LOST_PERIODS * period_cur)) {
+        cable_locked = false;
+        cable_lost_count++;
+        tb_trace('L', (int32_t)(now - cable_good), 0, now, cable_good);
+        period_cur = P.timebase_period ? P.timebase_period : 800000;
+    }
+    if (slave_mode() && !cable_in) corr_tick(now);
     edges++;
     last_edge = now;
+    if (cable_locked && cable_mode()) return;   /* the cable's edges drive the rotors and the skip flag */
     if (multi_active()) {
         rev++;
         multi_rev_start();
@@ -407,8 +614,12 @@ void timebase_supervisor(void)
      * waits for the button (or Bluetooth), so a master that came back after its slaves
      * timed out (reflashed, power cycled) left them all dark. Nor does a slave go to
      * stand-by while it hears a master (syncing, or locked and settling in). */
-    const bool hears = slave_mode() && (P.corr_status == CS_SYNCING || P.corr_status == CS_LOCKED);
-    if (P.sys_standby && slave_mode() && P.corr_status == CS_LOCKED) timebase_exit_standby();
+    if (cable_in && !cable_mode()) timebase_select_input();     /* mode changed by `set` */
+    cable_switch();
+    const bool hears = cable_locked ||
+                       (slave_mode() && (P.corr_status == CS_SYNCING || P.corr_status == CS_LOCKED));
+    if (P.sys_standby && (cable_locked || (slave_mode() && P.corr_status == CS_LOCKED)))
+        timebase_exit_standby();
     if (timebase_permits_emission() || P.sys_standby || hears) last_lock_ms = sys_ms();
     else if (sys_ms() - last_lock_ms > 60000u) P.sys_standby = true;
 }
@@ -430,7 +641,9 @@ bool emission_update(void)
               !P.sys_standby && timebase_permits_emission() &&
               (locked || !P.ootx_lock_required);
     gpio_write(PIN_EMITTER_PWR_N, !on);
-    gpio_write(PIN_SYNC_GATE, on && flash_rev);
+    /* Stock clears P1_0 as slave-cable (timebase_mr1_isr @0xCD36); raised, it silences
+     * our own cable input (ai/firmware/HARDWARE.md, P1_0). */
+    gpio_write(PIN_SYNC_GATE, on && flash_rev && !on_cable());
     carrier_enable(on && P.carrier_enable);
     emitting = on;
     return on;

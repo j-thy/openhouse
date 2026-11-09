@@ -32,6 +32,37 @@ struct Residual {
   std::function<void(const Jet*, Jet*)> evalJet;
 };
 
+// Why a frame's light was refused. Diagnostics only: the EKF maths, the limits and
+// their constants are unchanged. Before this a rejected frame left no trace beyond
+// rejectCount, so a log could say "this base's light keeps being rejected" but never
+// which limit refused it - which is the difference between a bad calibration, a
+// reflection, and a room that disagrees with the device.
+enum RejectReason {
+  kRejectNone = 0,
+  kRejectFewRows,       // fewer than 3 optical sensor rows in the frame
+  kRejectNaN,           // non-finite correction
+  kRejectImuRot,        // IMU rotation correction over its limit
+  kRejectGravMag,       // gravity magnitude correction over its limit
+  kRejectGravTilt,      // gravity tilt correction over its limit
+  kRejectOmega,         // angular-rate correction over its limit
+  kRejectAltBaseTrans,  // an alternate base's position correction over its limit
+  kRejectAltBaseRot,    // an alternate base's rotation correction over its limit
+};
+
+inline const char* RejectReasonName(int reason) {
+  switch (reason) {
+    case kRejectFewRows: return "too few sensor rows";
+    case kRejectNaN: return "non-finite correction";
+    case kRejectImuRot: return "IMU rotation over limit";
+    case kRejectGravMag: return "gravity magnitude over limit";
+    case kRejectGravTilt: return "gravity tilt over limit";
+    case kRejectOmega: return "angular rate over limit";
+    case kRejectAltBaseTrans: return "alternate base position over limit";
+    case kRejectAltBaseRot: return "alternate base rotation over limit";
+    default: return "unknown";
+  }
+}
+
 class DirectFilter {
  public:
   DirectFilter();
@@ -68,6 +99,9 @@ class DirectFilter {
   bool imuUpdate = false;  // the update in progress is an IMU sample's (LighthouseDirect::ImuUpdate)
   uint32_t flags = 0;        // +0xf8
   int rejectCount = 0;       // +0xfc
+  // Diagnostics: which limit refused the last frame, and how many sensor rows it had.
+  int lastRejectReason = kRejectNone;
+  int lastRejectRows = 0;
 
   void DefaultState();                        // 0x3511a0 (state only)
   void InitialCovariance();                   // 0x350280 (diagonal only)
@@ -75,7 +109,7 @@ class DirectFilter {
   void Predict(double dtPos, double dtRot);    // 0x366610 (uses current Q)
   // 0x36cae0. Returns false if rejected (flags |= 0x200).
   bool Update(const std::vector<Residual>& res, const Mat& R, const Vec& z, bool gate = false);
-  bool RejectCorrection(const Vec& dx) const;  // 0x34f570
+  bool RejectCorrection(const Vec& dx);  // 0x34f570 (records lastRejectReason)
   // Runtime safety check for reusing IMU calibration after a tracking reset.
   // Does not change the verified EKF update/rejection maths.
   bool CalibrationHealthy() const;

@@ -96,6 +96,10 @@ if(LH_BUILD_USB)
   if(WIN32)
     find_package(hidapi CONFIG REQUIRED)
     set(LH_HIDAPI_TARGET hidapi::hidapi)
+  elseif(APPLE)
+    find_package(hidapi CONFIG REQUIRED)
+    set(LH_HIDAPI_TARGET hidapi::hidapi)
+    find_path(HIDAPI_PARENT_DIR NAMES "hidapi/hidapi.h")
   else()
     # hidapi's hidraw backend, built in with hidden symbols (third_party/hidapi/README.md):
     # a host's own hidapi (monado-service: libusb backend) must not replace it.
@@ -123,6 +127,7 @@ if(LH_BUILD_USB)
   target_include_directories(lh_usb PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/transport/usb>
+    $<$<BOOL:${HIDAPI_PARENT_DIR}>:$<BUILD_INTERFACE:${HIDAPI_PARENT_DIR}>>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
   target_include_directories(lh_usb PRIVATE src)
   target_link_libraries(lh_usb PUBLIC lh_common ${LH_HIDAPI_TARGET} Threads::Threads ZLIB::ZLIB)
@@ -192,6 +197,8 @@ if(LH_BUILD_OPENVR_DRIVER AND LH_BUILD_USB AND OPENVR_INCLUDE_DIR)
   if(WIN32)
     target_link_libraries(driver_lighthouse PRIVATE setupapi hid)  # stock_hmd: hiding devices from the stock DLL
     set(LH_OPENVR_PLATFORM win64)
+  elseif(APPLE)
+    set(LH_OPENVR_PLATFORM osx)
   else()
     set(LH_OPENVR_PLATFORM linux64)
   endif()
@@ -202,7 +209,7 @@ if(LH_BUILD_OPENVR_DRIVER AND LH_BUILD_USB AND OPENVR_INCLUDE_DIR)
   target_link_libraries(driver_lighthouse PRIVATE lh_report lh_tracking lh_usb Ceres::ceres Eigen3::Eigen nlohmann_json::nlohmann_json)
   find_package(Python3 COMPONENTS Interpreter QUIET)
   find_program(PATCHELF_EXECUTABLE patchelf)
-  if(NOT WIN32 AND Python3_Interpreter_FOUND AND PATCHELF_EXECUTABLE)
+  if(NOT WIN32 AND NOT APPLE AND Python3_Interpreter_FOUND AND PATCHELF_EXECUTABLE)
     add_custom_target(driver_package
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/scripts/package-driver.py
         $<TARGET_FILE:driver_lighthouse> ${CMAKE_BINARY_DIR}/driver-package
@@ -210,7 +217,7 @@ if(LH_BUILD_OPENVR_DRIVER AND LH_BUILD_USB AND OPENVR_INCLUDE_DIR)
       COMMENT "Bundling driver dependencies for Steam Runtime")
   endif()
   # Only HmdDriverFactory is exported, so nothing clashes with the host process.
-  if(NOT WIN32)
+  if(NOT WIN32 AND NOT APPLE)
     target_link_options(driver_lighthouse PRIVATE
       -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/src/openvr/exports.map -Wl,--no-undefined)
   endif()
@@ -314,7 +321,7 @@ if(LH_BUILD_TESTS)
     set_tests_properties(capture_no_overwrite PROPERTIES WILL_FAIL TRUE)
   endif()
 
-  if(LH_BUILD_ORACLE_TESTS AND NOT WIN32)
+  if(LH_BUILD_ORACLE_TESTS AND NOT WIN32 AND NOT APPLE)
     add_executable(lh_oracle_tests
       tests/oracle/oracle.cpp
       tests/oracle/test_lighthouse_model.cpp

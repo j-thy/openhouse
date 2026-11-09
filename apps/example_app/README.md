@@ -14,7 +14,7 @@ It builds openhouse's library from the source in this repository. To use another
 ```sh
 cmake -S . -B build -DOPENHOUSE_SOURCE_DIR=/path/to/openhouse
 ```
-You need the same dependencies as openhouse itself (Eigen, Ceres, nlohmann-json, zlib, and libudev on Linux)
+You need the same dependencies as openhouse itself (Eigen, Ceres, nlohmann-json, zlib, and libudev on Linux, or hidapi via Homebrew on macOS: `brew install eigen ceres-solver nlohmann-json hidapi ninja cmake`)
 
 ## Running
 ```sh

@@ -330,7 +330,7 @@ static void cmd_corr(void)
     con_printf("mode %s  correlator %s  est period %.1f  missed %u\n",
                P.timebase_mode < 5 ? tb_mode_names[P.timebase_mode] : "?", timebase_corr_state(),
                P.corr_period, P.corr_missed);
-    con_printf("optical pulses seen %u  used %u  last width %u ticks (%.1f us)  phase err %d ticks\n",
+    con_printf("optical pulses seen %u  used %u  last width (optical or cable) %u ticks (%.1f us)  phase err %d ticks\n",
                timebase_pulses_seen(), timebase_pulses_used(), timebase_last_width(),
                (float)timebase_last_width() / 48.0f, timebase_phase_err());
     timebase_dump_trace(con_printf);
