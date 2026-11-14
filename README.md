@@ -139,7 +139,7 @@ In SteamVR's settings there is an **openhouse** page (Settings > openhouse, you 
 Changes apply while you play, within a second.
 
 ### Mixed basestations (experimental)
-openhouse can use HTC Vive 1.0 and 2.0 basestations together in one room, which SteamVR can't. Turn it on with **Enable Mixed Basestations** in SteamVR's settings, or `"mixedLight": true` in `settings.json` under Monado and WiVRn. Things to know:
+openhouse can use HTC Vive 1.0 and 2.0 basestations together in one room, which SteamVR can't. Turn it on with **Enable Mixed Basestations** in SteamVR's settings, or `"mixedLight": true` in `settings.json` under Monado and WiVRn. (you can also enable **Headset measures the 2.0 stations' timing wobble for the other devices** setting to improve tracking even further) Things to know:
 - **Devices that do not work with 2.0 lighthouses can't be used** which includes the original HTC Vive headset, Vive wands and the 2017 Vive trackers (ones with gray power button instead of blue)
 - **The headset will stay on 2.0 mode at all times.** It times the 2.0 basestations for the other devices (the "headset times the 2.0 stations" toggle), so controllers and trackers have to switch less often. Switching that toggle off will cause the headset to blank the view every time a switch happens, so keep that in mind
 - **The headset also measures the 2.0 basestations' timing for the other devices** (the "headset measures the 2.0 stations' timing wobble" toggle, on by default). A 2.0 basestation's rotor doesn't spin perfectly evenly, and in mixed mode that shows up as a small wobble on controllers and trackers. The headset sees the real timing, so the others take that wobble off while the headset can see the same basestation

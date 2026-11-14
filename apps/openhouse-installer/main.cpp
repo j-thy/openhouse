@@ -88,16 +88,45 @@ bool Ask(const std::string& question) {
   return !answer.empty() && (answer[0] == 'y' || answer[0] == 'Y');
 }
 
-// Overwrites `to`, retrying for ~5 s.
+std::string SystemMessage(DWORD err) {
+  wchar_t* text = nullptr;
+  const DWORD n = FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                                 nullptr, err, 0, reinterpret_cast<wchar_t*>(&text), 0, nullptr);
+  std::wstring w = n && text ? std::wstring(text, n) : std::wstring();
+  if (text) LocalFree(text);
+  while (!w.empty() && (w.back() == L'\r' || w.back() == L'\n' || w.back() == L' ' || w.back() == L'.')) w.pop_back();
+  return Narrow(w) + " (error " + std::to_string(err) + ")";
+}
+
+// Overwrites `to`, retrying for ~5 s while it is locked. CopyFileW, not
+// std::filesystem::copy_file: some MinGW libstdc++ builds (Ubuntu's GCC 13) ignore
+// copy_options::overwrite_existing on Windows and fail with "File exists" whenever the
+// target is there, which made every install over SteamVR's driver fail.
 void CopyOver(const fs::path& from, const fs::path& to) {
   for (int i = 0;; ++i) {
-    std::error_code ec;
-    fs::copy_file(from, to, fs::copy_options::overwrite_existing, ec);
-    if (!ec) return;
-    if (i >= 20)
+    // A read-only target (e.g. a file copied from a read-only share) can't be replaced.
+    const DWORD attrs = GetFileAttributesW(to.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY))
+      SetFileAttributesW(to.c_str(), attrs & ~DWORD(FILE_ATTRIBUTE_READONLY));
+    if (CopyFileW(from.c_str(), to.c_str(), FALSE)) {
+      const DWORD copied = GetFileAttributesW(to.c_str());
+      if (copied != INVALID_FILE_ATTRIBUTES && (copied & FILE_ATTRIBUTE_READONLY))
+        SetFileAttributesW(to.c_str(), copied & ~DWORD(FILE_ATTRIBUTE_READONLY));
+      return;
+    }
+    const DWORD err = GetLastError();
+    const bool locked = err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION;
+    if (locked && i < 20) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      continue;
+    }
+    if (locked)
       throw Failure("Could not write " + Show(to) + " - a process still has it open. Close Steam and SteamVR completely, then run this again. (" +
-                    ec.message() + ")");
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                    SystemMessage(err) + ")");
+    if (err == ERROR_ACCESS_DENIED)
+      throw Failure("Could not write " + Show(to) + " - access denied. If SteamVR is installed in a protected folder, run this as administrator. (" +
+                    SystemMessage(err) + ")");
+    throw Failure("Could not copy " + Show(from) + " to " + Show(to) + ": " + SystemMessage(err));
   }
 }
 

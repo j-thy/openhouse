@@ -2,6 +2,7 @@
 // Algorithmic baseline; whole-driver parity is not yet established.
 #pragma once
 
+#include <array>
 #include <deque>
 #include <map>
 #include <optional>
@@ -176,6 +177,15 @@ class LighthouseDirect {
   double time_ = 0, lastOpticalTime_ = 0, opticalTimeout_ = 0.5;
   bool swing_ = false;
   double violentUntil_ = -1e300;  // IMU calibration held until (freezeImuCalibration)
+  // Vibration (#90): the accelerometer's first and second differences between samples,
+  // averaged over ~0.25 s. Jitter over kVibrationJitter (m/s2) with roughness over
+  // kVibrationRoughness times it holds gravity and the IMU calibration, and scales the
+  // accelerometer's variance by kVibrationAccelScale.
+  double accelJitter_ = 0, accelRoughness_ = 0;
+  double vibratingUntil_ = -1e300, vibrationAccelScale_ = 1.0;
+  std::array<std::array<double, 3>, 2> prevAccel_{};  // last sample, the one before
+  int havePrevAccel_ = 0;
+  static constexpr double kVibrationJitter = 1.5, kVibrationRoughness = 1.4, kVibrationAccelScale = 100;
   double sweepInterval_ = 1.0 / 60;
   std::optional<double> observedTime_;
   uint64_t bootstrapAttempts_ = 0;

@@ -118,6 +118,9 @@ class DirectFilter {
   // Not stock: during violent motion (saturated or near-limit IMU samples) the slow
   // states are held (see Update); the light then corrects the device's motion only.
   bool holdSlowStates = false;
+  // Not stock: gravity and the IMU calibration (states 18-30) held, nothing else: the
+  // accelerometer under vibration (#90). Lighter than holdSlowStates (no frame rejection).
+  bool holdImuCalibration = false;
   bool imuUpdate = false;  // the update in progress is an IMU sample's (LighthouseDirect::ImuUpdate)
   uint32_t flags = 0;        // +0xf8
   int rejectCount = 0;       // +0xfc

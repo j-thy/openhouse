@@ -63,6 +63,10 @@ inline std::array<uint8_t, 64> HapticReport(double frequency, double amplitude, 
 inline std::array<uint8_t, 64> PowerOffReport() {
   return {0xff, 0x9f, 4, 'o', 'f', 'f', '!'};
 }
+// A receiver's keepalive: report ff, opcode a1, no data. Stock driver_lighthouse (0x18004b5c0
+// in the Windows DLL, "Triggered keepalive") and lighthouse_console send it to a dongle
+// (28de:2101/2102) that has gone quiet.
+inline std::array<uint8_t, 64> ReceiverKeepaliveReport() { return {0xff, 0xa1, 0x00}; }
 // Optical sub-protocol (light report format) of a wireless device: 0 = LH1 pulses,
 // 1 = LH2 words. Same 0x87 command as the protocol-version request, entry type 1
 // instead of 0 ({u8 type, u16 value}; libsurvive vive_switch_mode).

@@ -7,11 +7,14 @@
 // What wakes it, polled once a second:
 // - a receiver (dongle, 28de:2101/2102) that had no device gets one: a controller or tracker
 //   was turned on;
-// - a wired device (28de:2000/2012/2022/2300) is plugged in.
+// - a wired device (28de:2000/2012/2022/2300) is plugged in, unless SteamVR knows it as a
+//   controller or tracker (WiredPlugInWakes): those show up on a charging cable while off (#91).
+//   A Vive tracker and the Bigscreen Beyond are both 28de:2300, so it goes by the serial.
 // Devices already there when the watchdog starts don't wake it: SteamVR was just closed with
 // them, or Steam is starting.
 #include "watchdog.hpp"
 
+#include "../platform/platform.hpp"
 #include "../transport/usb/usb_transport.hpp"
 
 #include <hidapi/hidapi.h>
@@ -32,6 +35,12 @@ constexpr uint16_t kValve = 0x28de;
 
 bool IsReceiver(uint16_t pid) { return pid == 0x2101 || pid == 0x2102; }
 bool IsWired(uint16_t pid) { return pid == 0x2000 || pid == 0x2012 || pid == 0x2022 || pid == 0x2300; }
+
+std::string Narrow(const wchar_t* s) {
+  std::string out;
+  for (; s && *s; ++s) out += *s < 0x80 ? char(*s) : '?';
+  return out;
+}
 
 class Watchdog final : public IVRWatchdogProvider {
  public:
@@ -92,7 +101,16 @@ class Watchdog final : public IVRWatchdogProvider {
         }
       } else if (IsWired(d->product_id) && d->interface_number == 0) {
         seenWired.insert(path);
-        if (!first && !wired_.count(path)) Wake(d->product_id == 0x2000 ? TrackedDeviceClass_HMD : TrackedDeviceClass_Controller);
+        if (!first && !wired_.count(path)) {
+          const std::string serial = Narrow(d->serial_number);
+          const std::string config =
+              serial.empty() ? std::string() : lh::usb::UsbTransport::LoadSteamConfig(lh::platform::SteamConfigDirectory(), serial);
+          if (WiredPlugInWakes(config)) {
+            Wake(d->product_id == 0x2000 ? TrackedDeviceClass_HMD : TrackedDeviceClass_Controller);
+          } else if (VRDriverLog()) {
+            VRDriverLog()->Log(("lh: [INFO] watchdog: " + serial + " plugged in, a controller or tracker charging: not starting SteamVR\n").c_str());
+          }
+        }
       }
     }
     hid_free_enumeration(list);

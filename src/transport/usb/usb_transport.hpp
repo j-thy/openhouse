@@ -16,6 +16,7 @@
 #include <string>
 #include <set>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "lh/input_sink.hpp"
@@ -148,6 +149,16 @@ class UsbTransport {
     int sensorType = -1;   // hardware id low byte (report 0x05), -1 unknown
     std::string path;      // hidapi path, unique while plugged in
     bool bluetooth = false;  // receiver's radio in Bluetooth mode: no device can connect
+    int keepalive = -1;      // last keepalive to a receiver with no device: 1 sent, 0 failed, -1 none yet
+    // A receiver can stay plugged in while another device paired to it connects (#92): its first
+    // data after a disconnect or a radio gap is checked against the device it was set up for
+    // (OtherDeviceConnected). lastData: host time of its last data report.
+    // The check runs on the probe thread (DeviceCheck), so it never holds up this one.
+    bool checkDevice = false;
+    bool checkPending = false;  // a DeviceCheck is queued or running
+    double lastData = 0;
+    // A receiver that doesn't answer the check is asked again until checkUntil, from nextCheck.
+    double checkUntil = 0, nextCheck = 0;
   };
   enum class OpenResult { Failed, Idle, Ready };
   // Opens and sets up one enumerated HID interface (Start and hotplug).
@@ -206,6 +217,20 @@ class UsbTransport {
   std::vector<PairCommand> pairing_;  // under hapticMutex_; read by the reader and probe threads
   // Run a pending pairing command for `o`'s receiver; true if one was sent.
   bool TakePairing(Open& o);
+  // The stock keepalive to a receiver with no device, each probe pass (logged when it changes).
+  void KeepAlive(Open& o);
+  // #92: which device a wireless receiver has, asked by the probe thread on a handle of its own
+  // (the query can take ~0.1 s and the reader thread serves every device). path: the receiver's
+  // interface; serial: the device it was set up for; result: 1 another device, 0 the same,
+  // -1 no answer, unset while queued.
+  struct DeviceCheck {
+    std::string path, serial, receiver;
+    std::optional<int> result;
+  };
+  std::vector<std::shared_ptr<DeviceCheck>> deviceChecks_;  // under hapticMutex_
+  std::unordered_map<std::string, std::shared_ptr<DeviceCheck>> runningChecks_;  // reader thread only, by path
+  void RunDeviceChecks();  // probe thread
+  int OtherDeviceConnected(const std::string& path, const std::string& serial, const std::string& receiver);
   // A radio command for the thread that owns the receiver. set: the mode to switch to, or
   // nullopt to read it. result: the mode set or read, nullopt if that failed.
   struct RadioCommand {

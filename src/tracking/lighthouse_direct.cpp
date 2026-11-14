@@ -6,7 +6,6 @@
 #include <cmath>
 #include <limits>
 #include <cstdio>
-#include <cstdlib>
 
 #include "pose_solver.hpp"
 #include "pulse_sorter.hpp"
@@ -153,7 +152,7 @@ bool LighthouseDirect::ImuUpdate(const ImuSample& sample) {
           Jet r[3]; if (kind == 0) ImuGyro(x, r); else ImuAccel(x, r); out[0] = r[axis];
         }});
       measurements.push_back(kind == 0 ? sample.gyro[size_t(axis)] : sample.accel[size_t(axis)]);
-      variances.push_back(bound ? (kind == 0 ? 0.25 : 4.0) : kind == 0 ? 1.6e-5 : (axis == 2 ? 0.003 : 0.0015));
+      variances.push_back(bound ? (kind == 0 ? 0.25 : 4.0) : kind == 0 ? 1.6e-5 : (axis == 2 ? 0.003 : 0.0015) * vibrationAccelScale_);
     }
   }
   if (sample.saturated) filter_.flags |= 0x400;
@@ -163,6 +162,38 @@ bool LighthouseDirect::ImuUpdate(const ImuSample& sample) {
     double g = 0, a = 0;
     for (int i = 0; i < 3; ++i) { g = std::max(g, std::fabs(sample.gyro[size_t(i)])); a = std::max(a, std::fabs(sample.accel[size_t(i)])); }
     if (sample.saturated || g > 25 || a > 60) violentUntil_ = sample.time + 0.3;
+    // Not stock: vibration (a controller's haptics held on) shakes some IMUs hard without
+    // reaching their limits: the accelerometer jumps 2-4 m/s2 from one sample to the next
+    // and its average reads 11-12.5 m/s2, not 9.8. Learned from that, the IMU alignment came
+    // out 17-21 deg off within 1.5 s of every reacquire, tracking reset over and over and
+    // the controller flew off between (#90). From then until 0.5 s after, gravity and the
+    // IMU calibration are held and the accelerometer is trusted 100x less (from the next
+    // sample), so the light carries the pose. Vibration is told from a hard swing, which
+    // jumps as much per sample, by its roughness: the second difference over the first
+    // (both averaged over ~0.25 s) is ~1.9 (the reading flips nearly every sample), a
+    // swing's or a stomp's 0.4-1.0. (#90 recordings, two controllers: resets 21/8 and
+    // 17 -> 0-1, steps > 5 cm 387/246 and 93 -> 1-43. Held as violent motion instead,
+    // frames rejected too: a vibrating pickup in vrchat-01 flew off 4 m. On the jumps
+    // alone, without roughness, hard swings jumped twice as often.)
+    if (havePrevAccel_ > 1) {
+      double d1 = 0, d2 = 0;
+      for (int i = 0; i < 3; ++i) {
+        const double a = sample.accel[size_t(i)], p = prevAccel_[0][size_t(i)], q = prevAccel_[1][size_t(i)];
+        d1 += (a - p) * (a - p);
+        d2 += (a - 2 * p + q) * (a - 2 * p + q);
+      }
+      const double k = std::min(1.0, dt / 0.25);
+      accelJitter_ += k * (std::sqrt(d1) - accelJitter_);
+      accelRoughness_ += k * (std::sqrt(d2) - accelRoughness_);
+      if (accelJitter_ > kVibrationJitter && accelRoughness_ > kVibrationRoughness * accelJitter_)
+        vibratingUntil_ = sample.time + 0.5;
+    }
+    prevAccel_[1] = prevAccel_[0];
+    prevAccel_[0] = sample.accel;
+    havePrevAccel_ = std::min(havePrevAccel_ + 1, 2);
+    const bool vibrating = swing_ && sample.time < vibratingUntil_;
+    filter_.holdImuCalibration = vibrating;
+    vibrationAccelScale_ = vibrating ? kVibrationAccelScale : 1.0;
     filter_.holdSlowStates = swing_ && sample.time < violentUntil_;
   }
   residuals.push_back(Normalizer());

@@ -296,6 +296,8 @@ bool DirectFilter::Update(const std::vector<Residual>& res, const Mat& R, const 
     // (testswing, held: none / calibration / + other bases / + tilt: tracking 87 / 95
     // / 92 / 98 %, the light used 42 / 52 / 90 / 84 %, jumps > 5 cm 142 / 58 / 67 / 3.)
     K.middleRows(16, std::min(n, 49) - 16).setZero();
+  } else if (holdImuCalibration && n > 30) {
+    K.middleRows(18, 13).setZero();
   }
   Vec dx = K * y;
   // Not stock: a relearning (knocked) base whose light asks for more than the

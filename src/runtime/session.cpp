@@ -698,6 +698,18 @@ bool SessionImpl::SetUpDevice(const DeviceId& id, const std::string& config) {
       AxesRotation(json{{"plus_x", {-1.0, 0.0, 0.0}}, {"plus_z", {0.0, 0.0, -1.0}}, {"position", {0.0, 0.0, 0.001577}}},
                    &objectFromHead);
     }
+    // Knuckles EV2.0 (development Index controllers) ship a head with no position, and the
+    // stock driver gives them the Index controller's (same function, from "EV2.0" in the
+    // model number, "Right" for the right one): without it the model came out tilted about
+    // 25 deg and a few cm off the controller (#96).
+    if (d.info.model.find("Knuckles") != std::string::npos && d.info.model.find("EV2.0") != std::string::npos &&
+        objectFromHead.translation().isZero(1e-9)) {
+      const bool right = d.info.model.find("Right") != std::string::npos;
+      AxesRotation(json{{"plus_x", {right ? 0.984808 : 0.979413, right ? 0.0217501 : -0.0217501, right ? 0.200692 : -0.200692}},
+                        {"plus_z", {right ? -0.173648 : 0.173648, -0.416198, 0.892539}},
+                        {"position", {right ? 0.010757 : -0.010757, 0.021781, -0.04214}}},
+                   &objectFromHead);
+    }
     d.imuFromHead = objectFromImu.inverse() * objectFromHead;
     model.serial = id;
     d.tracker = std::make_unique<DeviceTracker>(id, model, &room_);

@@ -1,0 +1,152 @@
+# Builds the Linux driver, the Windows driver (MinGW cross-build) and the lhbs base
+# station firmware on every push and pull request, with the same scripts as a release
+# (scripts/build-*.sh), and uploads each package as a workflow artifact.
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch or pull request cancels the run still going.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # OpenVR's public headers (MIT), fetched at build time, never stored in the repo.
+  OPENVR_TAG: v2.15.6
+  VCPKG_MAX_CONCURRENCY: 4
+  # vcpkg's built packages (Ceres takes most of a cold build), reused between runs: see
+  # the "vcpkg cache" steps. vcpkg itself is checked out at vcpkg.json's builtin-baseline,
+  # so its scripts, part of every package's hash, only change with the baseline.
+  VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-cache
+  LH_VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libudev-dev libglfw3-dev libgl-dev patchelf
+      - name: OpenVR headers
+        run: |
+          git clone --depth 1 --branch "$OPENVR_TAG" https://github.com/ValveSoftware/openvr.git "$RUNNER_TEMP/openvr"
+          sudo mkdir -p /usr/include/openvr /usr/share/licenses/openvr
+          sudo cp "$RUNNER_TEMP"/openvr/headers/*.h /usr/include/openvr/
+          sudo cp "$RUNNER_TEMP/openvr/LICENSE" /usr/share/licenses/openvr/
+      - name: vcpkg at the baseline
+        run: |
+          baseline=$(python3 -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")
+          git clone https://github.com/microsoft/vcpkg.git "$LH_VCPKG_ROOT"
+          git -C "$LH_VCPKG_ROOT" checkout -q "$baseline"
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+      # A cache entry can't be overwritten, so each run that built a package saves a new
+      # one (keyed by run) and the next run restores the newest. Runs that built nothing
+      # save nothing; GitHub evicts old entries past its 10 GB limit.
+      - name: vcpkg cache (restore)
+        id: vcpkg-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-linux-${{ hashFiles('vcpkg.json', 'cmake/triplets/*') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-linux-${{ hashFiles('vcpkg.json', 'cmake/triplets/*') }}-
+            vcpkg-linux-
+      - run: find .vcpkg-cache -type f | sort > "$RUNNER_TEMP/vcpkg-before.txt"
+      - name: Build and package
+        run: scripts/build-linux.sh
+      - name: vcpkg cache (anything new?)
+        id: vcpkg-new
+        if: always()
+        run: |
+          find .vcpkg-cache -type f | sort > "$RUNNER_TEMP/vcpkg-after.txt"
+          cmp -s "$RUNNER_TEMP/vcpkg-before.txt" "$RUNNER_TEMP/vcpkg-after.txt" || echo "changed=true" >> "$GITHUB_OUTPUT"
+      - name: vcpkg cache (save)
+        if: always() && steps.vcpkg-new.outputs.changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-linux-${{ hashFiles('vcpkg.json', 'cmake/triplets/*') }}-${{ github.run_id }}
+      - name: Tests
+        run: ctest --test-dir build-release --output-on-failure
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openhouse-driver-linux
+          path: dist/openhouse-driver-linux.tar.gz
+          if-no-files-found: error
+
+  windows:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config mingw-w64
+          # std::thread needs MinGW's posix thread model (Ubuntu defaults to win32).
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+      - name: OpenVR headers
+        run: |
+          git clone --depth 1 --branch "$OPENVR_TAG" https://github.com/ValveSoftware/openvr.git "$RUNNER_TEMP/openvr"
+          sudo mkdir -p /usr/include/openvr /usr/share/licenses/openvr
+          sudo cp "$RUNNER_TEMP"/openvr/headers/*.h /usr/include/openvr/
+          sudo cp "$RUNNER_TEMP/openvr/LICENSE" /usr/share/licenses/openvr/
+      - name: vcpkg at the baseline
+        run: |
+          baseline=$(python3 -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")
+          git clone https://github.com/microsoft/vcpkg.git "$LH_VCPKG_ROOT"
+          git -C "$LH_VCPKG_ROOT" checkout -q "$baseline"
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+      # A cache entry can't be overwritten, so each run that built a package saves a new
+      # one (keyed by run) and the next run restores the newest. Runs that built nothing
+      # save nothing; GitHub evicts old entries past its 10 GB limit.
+      - name: vcpkg cache (restore)
+        id: vcpkg-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-mingw-${{ hashFiles('vcpkg.json', 'cmake/triplets/*') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-mingw-${{ hashFiles('vcpkg.json', 'cmake/triplets/*') }}-
+            vcpkg-mingw-
+      - run: find .vcpkg-cache -type f | sort > "$RUNNER_TEMP/vcpkg-before.txt"
+      - name: Build and package
+        run: scripts/build-windows.sh
+      - name: vcpkg cache (anything new?)
+        id: vcpkg-new
+        if: always()
+        run: |
+          find .vcpkg-cache -type f | sort > "$RUNNER_TEMP/vcpkg-after.txt"
+          cmp -s "$RUNNER_TEMP/vcpkg-before.txt" "$RUNNER_TEMP/vcpkg-after.txt" || echo "changed=true" >> "$GITHUB_OUTPUT"
+      - name: vcpkg cache (save)
+        if: always() && steps.vcpkg-new.outputs.changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-mingw-${{ hashFiles('vcpkg.json', 'cmake/triplets/*') }}-${{ github.run_id }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openhouse-windows-x64
+          path: dist/openhouse-windows-x64.zip
+          if-no-files-found: error
+
+  firmware:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
+      - name: Build, host test and package
+        run: scripts/build-firmware.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openhouse-basestation-firmware
+          path: dist/openhouse-basestation-firmware.zip
+          if-no-files-found: error

@@ -13,6 +13,11 @@
 #include "openvr/host_frame.hpp"
 #include "openvr/haptic_routing.hpp"
 #include "openvr/telemetry_server.hpp"
+#include "openvr/watchdog.hpp"
+#include "openvr/pairing_mailbox.hpp"
+#include "lh/session.hpp"
+#include <cstring>
+#include <deque>
 #include "common/net.hpp"
 #include "lh/log_level.hpp"
 #include <chrono>
@@ -50,6 +55,15 @@ TEST(DeviceCommands, PowerOffWireFormat) {
   EXPECT_EQ(report[0], 0xff); EXPECT_EQ(report[1], 0x9f); EXPECT_EQ(report[2], 4);
   EXPECT_EQ(std::string(report.begin() + 3, report.begin() + 7), "off!");
   for (size_t i = 7; i < report.size(); ++i) EXPECT_EQ(report[i], 0);
+}
+
+// As stock and lighthouse_console send it to a quiet dongle: report ff, opcode a1, no data.
+TEST(DeviceCommands, ReceiverKeepaliveWireFormat) {
+  const auto report = lh::usb::ReceiverKeepaliveReport();
+  EXPECT_EQ(report.size(), 64u);
+  EXPECT_EQ(report[0], 0xff);
+  EXPECT_EQ(report[1], 0xa1);
+  for (size_t i = 2; i < report.size(); ++i) EXPECT_EQ(report[i], 0);
 }
 
 TEST(DeviceCommands, RoutesModernAndLegacyHapticsWithoutBroadcast) {
@@ -529,6 +543,7 @@ TEST(SteamRooms, WritesOurUniverseAndLeavesSteamVRsAlone) {
 
   std::ifstream in(path);
   const auto j = nlohmann::json::parse(in);
+  in.close();  // Windows can't remove an open file
   ASSERT_EQ(j.at("known_universes").size(), 2u);
   EXPECT_EQ(j.at("known_universes")[0], nlohmann::json::parse(steamUniverse));
   EXPECT_EQ(j.at("revision"), 6);
@@ -560,4 +575,174 @@ TEST(SteamRooms, ReadsChaperoneUniverses) {
   EXPECT_EQ(lh::openvr::ChaperoneUniverses(path), (std::set<std::string>{"1770781428", "42"}));
   std::filesystem::remove(path);
   EXPECT_TRUE(lh::openvr::ChaperoneUniverses(path).empty());
+}
+
+// #91: a tracker or controller on a charging cable shows up on USB while off, so plugging it in doesn't
+// start SteamVR; a headset (the Bigscreen Beyond is the same 28de:2300 as a Vive tracker) or a device SteamVR
+// has no config for does. Configs as SteamVR caches them (config/lighthouse/<serial>/config.json).
+TEST(Watchdog, APluggedInTrackerOrControllerIsCharging) {
+  using lh::openvr::WiredPlugInWakes;
+  EXPECT_FALSE(WiredPlugInWakes(R"({"device_class": "generic_tracker", "model_number": "VIVE Tracker 3.0 MV"})"));
+  EXPECT_FALSE(WiredPlugInWakes(R"({"device_class": "controller", "model_number": "Knuckles Left"})"));
+  EXPECT_TRUE(WiredPlugInWakes(R"({"manufacturer": "Bigscreen", "model_number": "Beyond", "device_class": "hmd"})"));
+  EXPECT_TRUE(WiredPlugInWakes(""));                         // never seen by SteamVR
+  EXPECT_TRUE(WiredPlugInWakes("{not json"));                // unreadable
+  EXPECT_TRUE(WiredPlugInWakes(R"({"model_number": "x"})"));  // no class
+  EXPECT_TRUE(WiredPlugInWakes(R"({"device_class": 3})"));
+}
+
+// SteamVR's pairing menu, as its page (pairing.js) talks to the "lighthouse_pairing" mailbox.
+#undef SendMessage  // <windows.h> renames it (IVRMailbox was declared without it)
+namespace {
+struct FakeMailbox : lh::openvr::IVRMailbox {
+  std::deque<std::string> inbox;
+  std::vector<nlohmann::json> sent;
+  int RegisterMailbox(const char*, uint64_t* handle, char* address, uint32_t size) override {
+    *handle = 1;
+    std::snprintf(address, size, "lighthouse_pairing/1");
+    return 0;
+  }
+  int UndoRegisterMailbox(uint64_t) override { return 0; }
+  int SendMessage(uint64_t, const char*, const char* message) override {
+    sent.push_back(nlohmann::json::parse(message));
+    return 0;
+  }
+  int ReadMessage(uint64_t, char* buffer, uint32_t size, uint32_t* needed) override {
+    *needed = 0;
+    if (inbox.empty()) return 1;
+    *needed = uint32_t(inbox.front().size() + 1);
+    if (*needed > size) return 1;
+    std::memcpy(buffer, inbox.front().c_str(), *needed);
+    inbox.pop_front();
+    return 0;
+  }
+  std::vector<std::string> Results() const {
+    std::vector<std::string> results;
+    for (const auto& m : sent)
+      if (m.value("type", "") == "pairing_result") results.push_back(m.value("result", ""));
+    return results;
+  }
+};
+
+struct FakeContext : vr::IVRDriverContext {
+  lh::openvr::IVRMailbox* mailbox;
+  explicit FakeContext(lh::openvr::IVRMailbox* m) : mailbox(m) {}
+  void* GetGenericInterface(const char* version, vr::EVRInitError* error) override {
+    if (error) *error = vr::VRInitError_None;
+    return std::strcmp(version, lh::openvr::kMailboxVersion) == 0 ? mailbox : nullptr;
+  }
+  vr::DriverHandle_t GetDriverHandle() override { return 0; }
+};
+
+// Only the receivers and their pairing mode.
+struct PairingSession : lh::Session {
+  std::vector<Receiver> receivers;
+  std::vector<std::pair<std::string, double>> pairing;  // SetPairing calls
+  bool Start(std::string*) override { return true; }
+  void Stop() override {}
+  bool Running() const override { return true; }
+  bool Finished() const override { return false; }
+  lh::SessionSnapshot Snapshot() const override { return {}; }
+  std::vector<lh::DeviceUpdate> Updates() const override { return {}; }
+  double HostNow() const override { return 0; }
+  std::vector<lh::SessionEvent> PollEvents() override { return {}; }
+  void SetDeviceEnabled(const std::string&, bool) override {}
+  void SetOutputTuning(double, double, bool) override {}
+  void SetMixedLight(const lh::MixedLightOptions&) override {}
+  std::vector<Receiver> Receivers() const override { return receivers; }
+  bool SetPairing(const std::string& receiver, double seconds) override {
+    pairing.emplace_back(receiver, seconds);
+    return true;
+  }
+  bool HasBluetoothRadio() const override { return false; }
+  bool SetBluetoothRadio(bool) override { return false; }
+  std::optional<bool> BluetoothRadioOn() override { return std::nullopt; }
+  bool SetCapture(const std::string&) override { return false; }
+  bool Haptic(const std::string&, double, double, double) override { return false; }
+  bool PowerOff(const std::string&) override { return false; }
+  void ResetRoom() override {}
+  uint64_t RoomResets() const override { return 0; }
+  bool SaveRoom(std::string*) override { return true; }
+};
+
+std::string StartPairing(const std::string& receiver, double seconds) {
+  return nlohmann::json{{"type", "start_pairing"}, {"returnAddress", "pairing_ui/page"}, {"serial", receiver},
+                        {"timeoutSeconds", seconds}}
+      .dump();
+}
+}  // namespace
+
+// The page sends start_pairing again every 5 s while it waits. That keeps the pairing going,
+// as in stock: the receiver is re-armed and nothing is answered. "canceled" would show the page
+// a paired device (it takes it like "success"), and the restart then timed out.
+TEST(PairingMailbox, SteamVRsKeepAliveKeepsThePairingGoing) {
+  FakeMailbox mailbox;
+  FakeContext context(&mailbox);
+  PairingSession session;
+  session.receivers = {{"DA9B68FD61", ""}};
+  lh::openvr::PairingMailbox pairing;
+  ASSERT_TRUE(pairing.Open(&context, nullptr));
+
+  mailbox.inbox.push_back(StartPairing("DA9B68FD61", 10));
+  pairing.Poll(session, "");
+  mailbox.inbox.push_back(StartPairing("DA9B68FD61", 10));
+  pairing.Poll(session, "");
+  ASSERT_EQ(session.pairing.size(), 2u);  // re-armed
+  EXPECT_EQ(session.pairing[1], std::make_pair(std::string("DA9B68FD61"), 10.0));
+  EXPECT_TRUE(mailbox.Results().empty());
+
+  session.receivers = {{"DA9B68FD61", "LHR-12CB1821"}};
+  pairing.Poll(session, "");
+  ASSERT_EQ(mailbox.Results(), std::vector<std::string>{"success"});
+  EXPECT_EQ(mailbox.sent.back().value("connectedSerial", ""), "LHR-12CB1821");
+}
+
+// Each keep-alive moves the deadline; without one the pairing times out.
+TEST(PairingMailbox, AKeepAliveMovesTheDeadline) {
+  FakeMailbox mailbox;
+  FakeContext context(&mailbox);
+  PairingSession session;
+  session.receivers = {{"DA9B68FD61", ""}};
+  lh::openvr::PairingMailbox pairing;
+  ASSERT_TRUE(pairing.Open(&context, nullptr));
+
+  mailbox.inbox.push_back(StartPairing("DA9B68FD61", 0.05));
+  mailbox.inbox.push_back(StartPairing("DA9B68FD61", 600));
+  pairing.Poll(session, "");
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  pairing.Poll(session, "");
+  EXPECT_TRUE(mailbox.Results().empty());
+
+  mailbox.inbox.push_back(nlohmann::json{{"type", "stop_pairing"}, {"returnAddress", "pairing_ui/page"},
+                                         {"serial", "DA9B68FD61"}}.dump());
+  pairing.Poll(session, "");
+  EXPECT_EQ(session.pairing.back(), std::make_pair(std::string("DA9B68FD61"), 0.0));
+  EXPECT_EQ(mailbox.Results(), std::vector<std::string>{"canceled"});
+
+  mailbox.inbox.push_back(StartPairing("DA9B68FD61", 0.05));
+  pairing.Poll(session, "");
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  pairing.Poll(session, "");
+  EXPECT_EQ(mailbox.Results(), (std::vector<std::string>{"canceled", "timeout"}));
+}
+
+// A keep-alive doesn't restart the pairing: a device that replaced the one on the receiver
+// when the pairing started is still taken as paired.
+TEST(PairingMailbox, AKeepAliveKeepsWhatWasOnTheReceiver) {
+  FakeMailbox mailbox;
+  FakeContext context(&mailbox);
+  PairingSession session;
+  session.receivers = {{"DA9B68FD61", "LHR-529CFBB5"}};
+  lh::openvr::PairingMailbox pairing;
+  ASSERT_TRUE(pairing.Open(&context, nullptr));
+
+  mailbox.inbox.push_back(StartPairing("DA9B68FD61", 10));
+  pairing.Poll(session, "");
+  EXPECT_TRUE(mailbox.Results().empty());
+
+  session.receivers = {{"DA9B68FD61", "LHR-12CB1821"}};
+  mailbox.inbox.push_back(StartPairing("DA9B68FD61", 10));
+  pairing.Poll(session, "");
+  ASSERT_EQ(mailbox.Results(), std::vector<std::string>{"success"});
+  EXPECT_EQ(mailbox.sent.back().value("connectedSerial", ""), "LHR-12CB1821");
 }

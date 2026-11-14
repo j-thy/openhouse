@@ -1266,6 +1266,7 @@ TEST(RoomMap, RoomLearnedWithoutModelScalesIsRefinedOnce) {
   ASSERT_TRUE(room.Save(path));
   std::ifstream in(path);
   EXPECT_EQ(nlohmann::json::parse(in).at("rooms")[0].at("modelScale"), lh::runtime::Room::kModelScale);
+  in.close();  // Windows can't remove an open file
   RoomMap again;
   ASSERT_TRUE(again.Load(path));
   std::filesystem::remove(path);

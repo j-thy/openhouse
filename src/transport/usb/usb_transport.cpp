@@ -35,6 +35,11 @@ void UsbTransport::Log(LogLevel level, const char* format, ...) {
 }
 namespace {
 
+// No wireless data for this long: a new radio epoch (the receiver may have missed the off notification).
+constexpr double kRadioGap = 1.0;  // s
+// #92: how long a receiver that doesn't say which device it has is asked again, and how often.
+constexpr double kDeviceCheck = 3.0, kDeviceRecheck = 0.25;  // s
+
 constexpr uint16_t kValveVid = 0x28de;
 
 double HostNow() {
@@ -132,7 +137,7 @@ void ReportDecoder::OnReport(double hostTime, uint16_t epId, bool last, const ui
     if (data[0] != 0x23 && data[0] != 0x24) return;
     // Some receivers miss the off notification. A radio data gap is an epoch
     // boundary: discard protocol substate, IMU dedup timestamps and clock fit.
-    if (ep.lastWirelessReport && hostTime - ep.lastWirelessReport > 1.0) ResetWireless(ep);
+    if (ep.lastWirelessReport && hostTime - ep.lastWirelessReport > kRadioGap) ResetWireless(ep);
     if (!ep.connected) {
       sink_->OnDeviceAttached(ep.info.serial, ep.info.configJson);
       ep.connected = true;
@@ -180,6 +185,46 @@ std::optional<uint32_t> UsbTransport::ConnectedSerial(hid_device_* receiver) {
   DeviceInfo di;
   if (!QueryDeviceInfo(receiver, &di, 2)) return std::nullopt;
   return di.serial;
+}
+
+// #92: whether the device on a receiver is no longer the one it was set up for. A dongle can be
+// paired with several devices and serves whichever is on (one at a time), staying plugged in; it was
+// identified only when opened, so a 3.0 tracker switched on in place of a 2018 one was taken for it,
+// with the 2018's sensor layout. Asked only after a disconnect or a radio gap (Run asks again while
+// the receiver doesn't answer). Runs on the probe thread, on a second handle to the receiver: the
+// reader thread's handle stays its own. 1: another device, 0: the same one, -1: no answer.
+int UsbTransport::OtherDeviceConnected(const std::string& path, const std::string& serial, const std::string& receiver) {
+  hid_device* h = nullptr;
+  {
+    static std::mutex openMutex;  // hid_open_path's error string is process-wide (#49.5)
+    std::lock_guard openLock(openMutex);
+    h = hid_open_path(path.c_str());
+  }
+  if (!h) return -1;
+  DeviceInfo di;
+  const bool ok = QueryDeviceInfo(h, &di, 2) && di.serial != 0;
+  hid_close(h);
+  if (!ok) return -1;
+  char sn[16];
+  snprintf(sn, sizeof sn, "LHR-%08X", di.serial);
+  if (serial == sn) return 0;
+  Log(LogLevel::Info, "%s: receiver %s now has %s; reopening it to set that device up\n", serial.c_str(), receiver.c_str(), sn);
+  return 1;
+}
+
+void UsbTransport::RunDeviceChecks() {
+  std::vector<std::shared_ptr<DeviceCheck>> checks;
+  {
+    std::lock_guard lock(hapticMutex_);
+    checks = deviceChecks_;
+  }
+  for (auto& c : checks) {
+    if (stop_) return;
+    const int result = OtherDeviceConnected(c->path, c->serial, c->receiver);
+    std::lock_guard lock(hapticMutex_);
+    c->result = result;
+    std::erase(deviceChecks_, c);
+  }
 }
 
 bool UsbTransport::QueryDeviceInfo(hid_device_* dev, DeviceInfo* info, int attempts) {
@@ -475,8 +520,21 @@ bool UsbTransport::SetPairing(const std::string& receiver, int milliseconds) {
     if (!receivers_.count(receiver)) return false;
   }
   std::lock_guard lock(hapticMutex_);
+  // A newer command replaces a pending one: only the last on or off counts, and a backlog
+  // would reach the receiver late (an "on" after a stop, or an old "off" in a new pairing).
+  std::erase_if(pairing_, [&](const PairCommand& c) { return c.receiver == receiver; });
   pairing_.push_back({receiver, std::clamp(milliseconds, 0, 0xffff)});
   return true;
+}
+
+void UsbTransport::KeepAlive(Open& o) {
+  // A VIVE Tracker 2018 didn't pair with a dongle we kept in pairing mode for over a minute,
+  // and did with lighthouse_console, which sends this to a quiet dongle (as stock does).
+  const auto report = ReceiverKeepaliveReport();
+  const int sent = hid_send_feature_report(o.dev, report.data(), report.size()) == int(report.size()) ? 1 : 0;
+  if (sent != o.keepalive)
+    Log(LogLevel::Info, "receiver %s: keepalive %s\n", o.receiver.c_str(), sent ? "sent" : "failed");
+  o.keepalive = sent;
 }
 
 bool UsbTransport::TakePairing(Open& o) {
@@ -588,17 +646,22 @@ std::optional<bool> UsbTransport::BluetoothRadioOn() {
 }
 
 void UsbTransport::ProbeMain() {
-  // Someone is waiting for each radio command, so they don't wait for the slow parts below.
-  const auto serveRadio = [this] {
-    for (auto& o : idle_) TakeRadioCommands(o);
+  // Someone is waiting for each radio or pairing command, so they don't wait for the slow
+  // parts below (a pass takes over a second).
+  const auto serve = [this] {
+    for (auto& o : idle_) {
+      TakeRadioCommands(o);
+      TakePairing(o);
+    }
+    RunDeviceChecks();
   };
   while (!stop_) {
     Enumerate(false);
     for (size_t i = 0; i < idle_.size() && !stop_;) {
-      serveRadio();
+      serve();
       Open& o = idle_[i];
-      TakePairing(o);
       if (o.bluetooth) { ++i; continue; }  // nothing can connect to it for now
+      KeepAlive(o);
       DeviceInfo di;
       if (!QueryDeviceInfo(o.dev, &di, 2) || di.serial == 0) { ++i; continue; }
       char sn[16];
@@ -617,7 +680,7 @@ void UsbTransport::ProbeMain() {
     }
     for (int k = 0; k < 10 && !stop_; ++k) {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      serveRadio();
+      serve();
     }
   }
 }
@@ -759,6 +822,54 @@ void UsbTransport::Run() {
       }
       for (int i = 0; i < count; i++) {
         const bool last = i == count - 1;
+        if (o.info.kind == EndpointKind::Wireless) {
+          // #92: after a disconnect or a radio gap, the first data may be another device paired to this
+          // receiver. Then it's reopened as one that has no device, as after pairing, and the new device
+          // set up when the probe picks it up; its data isn't decoded as the old one's meanwhile.
+          const uint8_t id = reps[i].buf[0];
+          const bool data = id == 0x23 || id == 0x24;
+          // A receiver that doesn't answer is asked again, every kDeviceRecheck for kDeviceCheck: the
+          // check without that missed a switch live. The probe thread asks (RunDeviceChecks); this
+          // thread only queues the check and reads its answer, so it never waits on the receiver.
+          if (id == 0x26 || (data && o.lastData > 0 && reps[i].t - o.lastData > kRadioGap)) {
+            o.checkDevice = true;
+            o.checkUntil = reps[i].t + kDeviceCheck;
+            o.nextCheck = 0;
+            // An answer asked for before this may be about the device that was there before.
+            if (o.checkPending) {
+              o.checkPending = false;
+              runningChecks_.erase(o.path);
+            }
+          }
+          if (o.checkPending) {
+            std::optional<int> other;
+            {
+              std::lock_guard lock(hapticMutex_);
+              other = runningChecks_[o.path]->result;
+            }
+            if (other) {
+              o.checkPending = false;
+              runningChecks_.erase(o.path);
+              if (*other >= 0 || reps[i].t > o.checkUntil) o.checkDevice = false;
+              else o.nextCheck = reps[i].t + kDeviceRecheck;
+              if (*other == 1) {
+                o.disconnected = true;
+                break;
+              }
+            }
+          }
+          if (data && o.checkDevice && !o.checkPending && reps[i].t >= o.nextCheck) {
+            auto check = std::make_shared<DeviceCheck>();
+            check->path = o.path;
+            check->serial = o.info.serial;
+            check->receiver = o.receiver;
+            runningChecks_[o.path] = check;
+            o.checkPending = true;
+            std::lock_guard lock(hapticMutex_);
+            deviceChecks_.push_back(check);
+          }
+          if (data) o.lastData = reps[i].t;
+        }
         capture_.WriteReport(reps[i].t, o.info.ep, last, reps[i].buf, size_t(reps[i].n));
         decoder_.OnReport(reps[i].t, o.info.ep, last, reps[i].buf, size_t(reps[i].n));
         if (o.info.kind == EndpointKind::Wireless && decoder_.WirelessGeneration(o.info.ep) != o.generation) {

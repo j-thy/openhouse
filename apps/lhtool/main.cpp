@@ -92,7 +92,14 @@ struct StatsSink : lh::InputSinkBase {
   std::map<std::string, Dev> devs;
   void OnDeviceAttached(const lh::DeviceId& d, const std::string& cfg) override { devs[d].hasConfig |= !cfg.empty(); }
   void OnClockOffset(const lh::DeviceId& d, double o) override { devs[d].offset = o; }
-  void OnImu(const lh::DeviceId& d, const lh::ImuSample& s) override { devs[d].imu++; devs[d].Time(s.time); }
+  void OnImu(const lh::DeviceId& d, const lh::ImuSample& s) override {
+    devs[d].imu++; devs[d].Time(s.time);
+    // LH_IMU_DUMP=SERIAL: that device's raw IMU samples to stdout (time ax ay az gx gy gz saturated).
+    static const char* dump = std::getenv("LH_IMU_DUMP");
+    if (dump && d == dump)
+      printf("imu %.6f %.4f %.4f %.4f %.5f %.5f %.5f %u\n", double(s.time), s.accel[0], s.accel[1], s.accel[2], s.gyro[0], s.gyro[1],
+             s.gyro[2], s.saturated);
+  }
   void OnLightPulse(const lh::DeviceId& d, const lh::LightPulse& p) override {
     devs[d].pulses++;
     devs[d].sensors[p.sensor]++;

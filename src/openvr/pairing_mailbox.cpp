@@ -103,15 +103,23 @@ void PairingMailbox::Poll(Session& session, const std::string& expected) {
       const double timeout = message.contains("timeoutSeconds") && message.at("timeoutSeconds").is_number()
                                  ? std::clamp(message.at("timeoutSeconds").get<double>(), 0.0, 600.0)
                                  : 10.0;
-      if (pairing_) Finish(session, "canceled", "", expected);
-      std::string before;
-      for (const auto& rcv : session.Receivers())
-        if (rcv.serial == serial) before = rcv.connected;
-      Pairing p;
-      p.receiver = serial;
-      p.returnAddress = address;
-      p.before = before;
-      p.sawEmpty = before.empty();
+      // SteamVR's pairing page sends start_pairing again every 5 s while it waits: a
+      // keep-alive. As in stock, it re-arms the receiver and moves the deadline, and the
+      // pairing goes on. Ending it with "canceled" would tell the page a device paired:
+      // it takes "canceled" the same as "success".
+      const bool again = pairing_ && pairing_->receiver == serial;
+      if (pairing_ && !again) Finish(session, "canceled", "", expected);
+      if (!again) {
+        std::string before;
+        for (const auto& rcv : session.Receivers())
+          if (rcv.serial == serial) before = rcv.connected;
+        pairing_ = Pairing{};
+        pairing_->receiver = serial;
+        pairing_->before = before;
+        pairing_->sawEmpty = before.empty();
+      }
+      Pairing& p = *pairing_;
+      if (!again || !address.empty()) p.returnAddress = address;
       p.haveMessageId = message.contains("message_id") && message.at("message_id").is_number();
       if (p.haveMessageId) p.messageId = message.at("message_id").get<double>();
       {
@@ -119,12 +127,13 @@ void PairingMailbox::Poll(Session& session, const std::string& expected) {
         p.sendStatus = it != message.end() && it->is_boolean() && it->get<bool>();
       }
       p.deadline = Now() + timeout;
-      pairing_ = p;
       if (!session.SetPairing(serial, timeout)) {
         Finish(session, "failed_to_start", "", expected);
         continue;
       }
-      if (log_) log_("pairing: receiver " + serial + " in pairing mode for " + std::to_string(int(timeout)) + " s");
+      if (log_)
+        log_("pairing: receiver " + serial + (again ? " still" : "") + " in pairing mode for " +
+             std::to_string(int(timeout)) + " s");
       if (p.sendStatus) Reply(address, Discover(session, expected, nullptr));
     } else if (type == "stop_pairing") {
       if (pairing_ && text("serial") == pairing_->receiver) {
