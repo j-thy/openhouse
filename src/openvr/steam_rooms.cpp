@@ -70,6 +70,10 @@ bool WriteUniverse(const std::string& path, const std::string& id, const std::ve
       const fs::path backup = fs::u8path(path + ".openhouse-backup");
       std::error_code ec;
       if (!fs::exists(backup, ec)) fs::copy_file(target, backup, ec);
+    } else if (std::error_code ec; fs::exists(target, ec)) {
+      // There but unreadable (on Windows, held open by SteamVR mid-write): writing now would
+      // replace SteamVR's whole database with only our universe. Try again next time.
+      throw std::runtime_error("exists but can't be read now");
     } else if (!fs::is_directory(target.parent_path())) {
       throw std::runtime_error("no SteamVR config directory");
     }

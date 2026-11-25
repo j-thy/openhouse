@@ -43,7 +43,12 @@ void MultiDisambiguator::Reset() {
   stationCount_ = 0;
   policyAll_ = false;
   multiVotes_ = stockVotes_ = lowShareVotes_ = 0;
-  active_ = mode_ == Mode::On;
+  // The stations didn't change when this device lost their sync (covered, at the edge of the
+  // room). Forgetting the layout too left it to be found again from scratch: 50 flash pairs or a
+  // whole OOTX frame, which took 90 s where the light was poor, while the two-base path reset
+  // on seeing more than two stations hundreds of times and the controller showed as lost
+  // (2026-11-24, four lhbs stations). A station's OOTX saying stock forgets it.
+  active_ = mode_ == Mode::On || (mode_ == Mode::Auto && layoutKnown_);
 }
 
 void MultiDisambiguator::OnPulse(int sensor, double t, double width) {
@@ -96,9 +101,15 @@ void MultiDisambiguator::Detect(const std::vector<Flash>& flashes) {
   // A lone station seen sweeping after < 35 % of its flashes: a stock base sweeps after
   // every flash (alone) or every other (paired); multi master at N >= 3 after 1/N.
   const auto& m = stations_[0];
-  if (m.flashes >= 400 && stockVotes_ == 0 && multiVotes_ == 0 && m.sweeps < 0.35 * m.flashes) ++lowShareVotes_;
+  // Not one whose OOTX says stock: a device facing away from a lone stock base still sees
+  // its flashes (the sync LEDs light the whole room) but none of its sweeps, and was taken
+  // for a multi master, then dropped every sweep as out of sequence and lost tracking with
+  // the base in plain view (2026-11-16, Beyond + Index, one 1.0 base in mode A).
+  if (m.flashes >= 400 && stockVotes_ == 0 && multiVotes_ == 0 && m.sweeps < 0.35 * m.flashes && !m.ootxStock)
+    ++lowShareVotes_;
   if ((multiVotes_ >= 50 && multiVotes_ > 5 * stockVotes_) || lowShareVotes_ >= 50) {
     active_ = true;
+    layoutKnown_ = true;
     char buf[160];
     snprintf(buf, sizeof buf, "multi-station layout detected (%d multi / %d stock flash pairs)\n", multiVotes_,
              stockVotes_);
@@ -367,6 +378,7 @@ bool MultiDisambiguator::Identify(Station& b, int bit) {
   b.mode = id.dynamic.mode;
   b.multiN = id.dynamic.multiN;
   b.multiSlot = id.dynamic.multiSlot;
+  b.ootxStock = !id.dynamic.multi;
   b.recentBits.clear();
   BaseDynamicState recalled = id.dynamic;
   recalled.cached = true;
@@ -389,6 +401,7 @@ void MultiDisambiguator::PushOotx(Station& st, int slot, int bit) {
     st.mode = dyn.mode;
     st.multiN = dyn.multiN;
     st.multiSlot = dyn.multiSlot;
+    st.ootxStock = !dyn.multi;
     if (dyn.multiN >= 2) stationCount_ = dyn.multiN;
     if (dyn.multi && dyn.multiSlot != slot && dyn.multiSlot >= 0 && dyn.multiSlot < kMaxSlots)
       pendingShift_ = dyn.multiSlot - slot;
@@ -401,8 +414,14 @@ void MultiDisambiguator::PushOotx(Station& st, int slot, int bit) {
     snprintf(buf, sizeof buf, "multi: base %08X at relative slot %d, OOTX %s N=%d slot=%d%s round 0x%x\n", cfg.serial,
              slot, dyn.multi ? "multi" : "stock", dyn.multiN, dyn.multiSlot, dyn.multiAll ? " policy ALL" : "", dyn.multiMask);
     if (active_ || dyn.multi) Log(buf);
+    if (!dyn.multi && layoutKnown_ && mode_ == Mode::Auto) {   // the stations were set back to stock
+      layoutKnown_ = false;
+      active_ = false;
+      Log("stations report stock mode: multi-station layout forgotten\n");
+    }
     if (dyn.multi && !active_ && mode_ == Mode::Auto) {
       active_ = true;
+      layoutKnown_ = true;
       Log("multi-station layout detected (OOTX mode byte)\n");
     }
   }

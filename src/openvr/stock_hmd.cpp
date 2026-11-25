@@ -1,5 +1,6 @@
 #include "stock_hmd.hpp"
 
+#include "device_abi.hpp"
 #include "pairing_mailbox.hpp"
 
 #include <algorithm>
@@ -268,8 +269,8 @@ void* HookImport(HMODULE module, const char* dll, const char* name, void* hook) 
 }
 
 // The stock DLL carries hidapi and exports it (hid_open_path, hid_get_feature_report...),
-// and drivers that rewrite a headset's config as it is read (CustomHeadsetOpenVR for Pimax,
-// #32) detour those exports in "driver_lighthouse.dll". Here that module is ours and the
+// and drivers that rewrite a headset's config as it is read (CustomHeadsetOpenVR for Pimax)
+// detour those exports in "driver_lighthouse.dll". Here that module is ours and the
 // stock code is "driver_lighthouse.dll.stock", so they hook ours and the stock driver read
 // the raw config: no display. Each exported hid_* of the stock DLL is patched to jump to
 // ours, so every HID call it makes (internal ones too: the patch is at the function's entry)
@@ -396,12 +397,15 @@ class StockHmd::DeviceProxy : public ITrackedDeviceServerDriver {
  public:
   DeviceProxy(StockHmd* owner, std::string serial, ITrackedDeviceServerDriver* inner)
       : owner_(owner), serial_(std::move(serial)), inner_(inner) {}
+  // What the host is given for it: GetPose in the host's order (device_abi.hpp).
+  ITrackedDeviceServerDriver* ForHost() { return forHost_.Host(); }
   EVRInitError Activate(uint32_t id) override {
     const EVRInitError r = inner_->Activate(id);
     if (r == VRInitError_None) {
       alive_ = true;
+      published_.SetActive(true);  // nothing from an earlier activation
       std::lock_guard lock(owner_->mutex_);
-      owner_->activated_.push_back({serial_, id, &alive_});
+      owner_->activated_.push_back({serial_, id, &alive_, &published_});
       // SteamVR sends "leave standby" when it comes up and the stock driver powers the
       // headset's panels then; other hosts (Monado) never do, and the panels stay dark.
       // Harmless under SteamVR (it is out of standby already).
@@ -418,21 +422,31 @@ class StockHmd::DeviceProxy : public ITrackedDeviceServerDriver {
   }
   void Deactivate() override {
     alive_ = false;  // ours stops publishing its pose first
+    published_.SetActive(false);  // and its last pose isn't this device's any more
     inner_->Deactivate();
   }
+  // StockHmd::Cleanup, before the stock provider's: GetPose no longer touches the stock device.
+  void Close() { published_.Close(); }
   void EnterStandby() override { inner_->EnterStandby(); }
   void* GetComponent(const char* name) override { return inner_->GetComponent(name); }
   void DebugRequest(const char* request, char* response, uint32_t size) override {
     if (owner_->requestHandler_ && owner_->requestHandler_(request, response, size)) return;
     inner_->DebugRequest(request, response, size);
   }
-  DriverPose_t GetPose() override { return inner_->GetPose(); }
+  // The pose ours published for it, once there is one, with qRotation as the head's rotation
+  // (PublishedPose, InHeadFrame). Before that, the stock driver's, which is built with the host's
+  // compiler; after cleanup, an invalid pose.
+  DriverPose_t GetPose() override {
+    return published_.Get([this] { return GetPoseFromOtherDriver(inner_); });
+  }
 
  private:
   StockHmd* owner_;
   std::string serial_;
   ITrackedDeviceServerDriver* inner_;
   std::atomic<bool> alive_{false};
+  PublishedPose published_;
+  DeviceForHost forHost_{this};
 };
 
 class StockHmd::Host : public IVRServerDriverHost {
@@ -446,7 +460,7 @@ class StockHmd::Host : public IVRServerDriverHost {
       owner_->devices_.push_back(proxy);
     }
     if (owner_->log_) owner_->log_(std::string("stock driver: head-mounted display ") + (serial ? serial : "?"));
-    return owner_->realHost_->TrackedDeviceAdded(serial, cls, proxy);
+    return owner_->realHost_->TrackedDeviceAdded(serial, cls, proxy->ForHost());
   }
   void TrackedDevicePoseUpdated(uint32_t id, const DriverPose_t& pose, uint32_t size) override {
     {
@@ -832,6 +846,14 @@ bool StockHmd::Load(const std::string& path, IVRDriverContext* realContext, LogF
 }
 
 void StockHmd::Cleanup() {
+  // First: other drivers (Bigscreen's eye tracking) may call the headset's GetPose from their own
+  // threads until the host unloads them, and the stock device may be gone after its Cleanup.
+  std::deque<DeviceProxy*> devices;
+  {
+    std::lock_guard lock(mutex_);
+    devices = devices_;
+  }
+  for (auto* proxy : devices) proxy->Close();
   if (provider_) provider_->Cleanup();
   provider_ = nullptr;
   // The library, proxies and context stay alive: the host may still hold the headset's

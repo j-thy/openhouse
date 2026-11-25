@@ -17,8 +17,8 @@ tracking of headsets, Index controllers and trackers. It's built as:
   and the runtime improves on it.
 - **`driver_lighthouse.so` / `.dll`**, an OpenVR driver on top of `liblh`. It's a
   drop-in for SteamVR and for Monado's `steamvr_lh` (WiVRn, xrizer, VRChat).
-- **Tools:** `openhouse-viewer` (live status of the running driver), `lhtool`, `lhviz`,
-  `lhcapture`, `openhouse-check`.
+- **Tools:** `openhouse-overlay` (management app: live status, settings, room, bug report), `lhtool`, `lhviz`,
+  `lhcapture`, `update-checker`.
 
 Headsets are tracked by openhouse; their display comes from SteamVR's stock driver,
 loaded at runtime for the headset only (`stock_hmd.cpp`). Base stations are exposed as
@@ -171,7 +171,7 @@ switches were removed for the release). Details and numbers are in `tracking_imp
     otherwise it is its own universe in the pinned frame above, and is written into
     `lighthousedb.json` (`"openhouse": true`, never imported back) so Room Setup has a
     universe to save to. Without it SteamVR asked for Room Setup on every start.
-- **RoomPublisher:** shared memory `/openhouse-room-<uid>` (Linux) or `Local\openhouse-room` (Windows; layout in
+- **RoomPublisher:** shared memory `/openhouse-room-<uid>` (Linux; layout in
   `include/lh/room_shm.h`). It carries every base's pose in the host frame, with
   σ and an origin flag, a *settled* flag (no base moving, all σ < 5 mm) and an *epoch*
   that changes when the settled room differs. Alignment tools can use it instead of the
@@ -188,7 +188,7 @@ switches were removed for the release). Details and numbers are in `tracking_imp
 | `~/.config/lh/roommap.json` | Rooms and base poses |
 | `~/.config/lh/hostframe.json` | Host frame anchors per room. Delete to re-anchor |
 | `~/.config/lh/settings.json` | `roles`, `controllers`, `disabledDevices`, `mixedLight` (SteamVR's page wins under vrserver) |
-| `~/.config/lh/viewer.json` | openhouse-viewer settings |
+| `~/.config/lh/overlay.json` | openhouse-overlay settings |
 
 Every environment variable is listed in the root `README.md`. For development: `LH_STOCK_FILTER`
 (stock tracking), `LH_REPLAY`, `LH_EVALUATE_ROOM`, `LH_CAPTURE`.
@@ -204,7 +204,7 @@ Diagnostics are DEBUG messages, not stderr prints.
 |---|---|
 | `lhtool session <capture.lhraw> --room R.json [--trace T.jsonl]` | Replay a capture through the whole runtime: events, poses, a 100 Hz trace |
 | `tools/eval_replay.sh <capture> OUT 50 8` | Score a change: valid %, coasting, spikes, jitter, per device |
-| `openhouse-viewer` | Live status of the running driver: devices, bases, room, 3D view, log by level; Report > Save bug report |
+| `openhouse-overlay` | SteamVR dashboard overlay or desktop window: devices, bases, dongles, room map, settings, log, bug report, floor calibration (non-SteamVR) |
 | `openhouse-compare` | openhouse and SteamVR's own driver (loaded in-process, Monado-style host) tracking the same device side by side, with per-side stats |
 | `apps/example_app` | Minimal standalone CMake project using `lh::Session` (user-facing integration example) |
 | `lhviz` | Developer 3D view running its own tracking (SteamVR closed) |
@@ -229,7 +229,7 @@ ctest --test-dir build -j8          # unit, oracle (bit-exact vs stock), runtime
 scripts/build-linux.sh              # release build -> dist/openhouse-driver-linux.tar.gz
 dist/openhouse-driver/install.sh    # stops nothing: close SteamVR / Monado / WiVRn first
 scripts/build-windows.sh            # MinGW cross build -> dist/openhouse-windows-x64.zip
-scripts/build-firmware.sh           # lhbs + installers -> dist/openhouse-basestation-firmware.zip
+scripts/build-firmware.sh           # lhbs + host test (the packages carry the image)
 ```
 
 Windows installer and build details: `windows_build.md`.

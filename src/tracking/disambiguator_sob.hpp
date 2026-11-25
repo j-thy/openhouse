@@ -20,6 +20,7 @@
 #pragma once
 
 #include <array>
+#include <bitset>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -50,13 +51,14 @@ class SobDisambiguator {
   // frames flow at once instead of after a whole OOTX frame (~8 s of unbroken light).
   // The base's stored configuration is announced (PopBaseConfig) when its channel shows up,
   // as if its OOTX had been decoded: the session then knows the base is in view.
-  void SetKnownChannels(const std::map<int, std::pair<BaseConfig, BaseDynamicState>>& channels);
+  void SetKnownChannels(const std::map<int, std::pair<BaseConfig, BaseDynamicState>>& channels,
+                        std::bitset<kChannels> blocked = {});
 
   // True once any LH2 word was seen.
   bool Active() const { return active_; }
   // The base on this channel, 0 while it isn't known.
   uint32_t ChannelSerial(int channel) const {
-    return channel >= 0 && channel < kChannels ? channels_[size_t(channel)].serial : 0;
+    return channel >= 0 && channel < kChannels && !blocked_[size_t(channel)] ? channels_[size_t(channel)].serial : 0;
   }
   bool PopFrame(OpticalFrame* out);
   // For merging with LH1 frames, since the filter drops a frame older than the last it used:
@@ -95,9 +97,12 @@ class SobDisambiguator {
   void PushOotx(Channel& c, int channel, int bit);  // bit < 0: revolution without a beam word
   void Skip(Channel& c, long revolutions);
   void Log(const std::string& s);
+  void DiscardFrames(Channel& c);
 
   std::map<int, std::pair<BaseConfig, BaseDynamicState>> known_;
+  std::bitset<kChannels> blocked_;
   void Announce(Channel& c, int channel, const BaseConfig& cfg, BaseDynamicState dyn);
+  void QueueConfig(int channel, const BaseConfig& cfg, BaseDynamicState dyn);
   bool active_ = false;
   int nextUniqueId_ = 0;
   std::array<Channel, kChannels> channels_{};

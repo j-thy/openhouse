@@ -123,7 +123,7 @@ void DirectFilter::Predict(double dtPos, double dtRot) {
   // step (position, velocity, orientation: 10 of 31-49, with ~37 entries off the identity), so
   // only those rows of F P and those columns of (F P) F^T are summed; the others are copies.
   // The same products as the dense form up to summation order; the dense pair of 49x49 GEMMs
-  // per IMU sample was most of the driver's CPU time (#39, #50).
+  // per IMU sample was most of the driver's CPU time.
   struct Row { int i; int count; int j[kStateSize]; double v[kStateSize]; };
   Row rows[kStateSize];
   int moving = 0;
@@ -336,7 +336,7 @@ bool DirectFilter::Update(const std::vector<Residual>& res, const Mat& R, const 
   // written here but never acted: the IMU samples between frames, which share this Update,
   // reset its count. Making it act, either applying the 7th frame or reacquiring at once,
   // was worse in the Beat Saber stand-ins - a 52 cm jump in one replay; fastmotion4/5 one
-  // more fly-away and 1 % less tracking - so the behaviour live-tested here is kept, #47.1.)
+  // more fly-away and 1 % less tracking - so the behaviour live-tested here is kept.)
   // Nor while the filter is still settling (fewer than 200 updates since a bootstrap or
   // reacquire): its large corrections then are the right ones (all 322 frames this gate
   // took from vrchat-01's 100-200 s were there). It acts in violent motion too, where

@@ -24,8 +24,7 @@ driver_lighthouse.so
 proto/
 *.so.stock
 libsurvive/
-re/*
-!re/ghidra_scripts/
+re/
 
 # Device configs dumped from hardware (serials, calibration)
 lhr-*/

@@ -1,6 +1,6 @@
 {
   "name": "lh-runtime",
-  "version-string": "1.0.3",
+  "version-string": "1.0.4",
   "builtin-baseline": "a5f736224e85b32e25a8ffc52562333180396642",
   "dependencies": [
     {"name": "ceres", "default-features": false, "features": ["schur"]},

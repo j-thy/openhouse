@@ -1,4 +1,4 @@
-// SteamVR room compatibility (#82): our rooms as SteamVR universes.
+// SteamVR room compatibility: our rooms as SteamVR universes.
 //
 // SteamVR keeps Room Setup (the chaperone: standing origin, play area) per universe in
 // chaperone_info.vrchap, and launches Room Setup when the universe a device reports has

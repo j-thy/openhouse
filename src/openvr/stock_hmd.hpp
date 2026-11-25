@@ -15,7 +15,7 @@
 // are dropped (ours sets it); every other property passes.
 // Of the stock provider's standby calls only LeaveStandby is forwarded (it turns the
 // headset's panels back on); EnterStandby would power off controllers it doesn't own
-// here. The headset's own device calls are forwarded.
+// here. The headset's own device calls are forwarded, except GetPose (PublishedPose).
 #pragma once
 
 #include <atomic>
@@ -32,6 +32,105 @@
 #include <openvr_driver.h>
 
 namespace lh::openvr {
+
+// The same pose with the head offset folded in: qRotation is the head's rotation and vecPosition
+// the head's position (qDriverFromHead becomes the identity), so worldFromDriver * pose *
+// driverFromHead is unchanged: a caller that applies qDriverFromHead and one that ignores it get
+// the same head pose. That needs the rotation and the position folded together; folding only the
+// rotation would misplace the head for callers that apply the offset. For callers that take
+// qRotation for the head's rotation and ignore qDriverFromHeadRotation: Bigscreen's eye tracking
+// driver does, and a Beyond's IMU sits half a turn about (nearly) +Y from its head frame, so with
+// the IMU's rotation that driver saw every nod and roll of the head reversed, and fast nods made it
+// hand SteamVR a gaze tens of degrees off (yaw was unaffected). The stock driver hands over the
+// IMU's rotation; we don't.
+// Velocities follow: linear of the head's origin, angular in the head frame.
+inline vr::DriverPose_t InHeadFrame(const vr::DriverPose_t& p) {
+  using Q = vr::HmdQuaternion_t;
+  const auto mul = [](const Q& a, const Q& b) {
+    return Q{a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z, a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+             a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x, a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w};
+  };
+  const auto rotate = [&mul](const Q& q, const double v[3], double out[3]) {
+    const Q r = mul(mul(q, Q{0, v[0], v[1], v[2]}), Q{q.w, -q.x, -q.y, -q.z});
+    out[0] = r.x; out[1] = r.y; out[2] = r.z;
+  };
+  const auto cross = [](const double a[3], const double b[3], double out[3]) {
+    out[0] = a[1] * b[2] - a[2] * b[1]; out[1] = a[2] * b[0] - a[0] * b[2]; out[2] = a[0] * b[1] - a[1] * b[0];
+  };
+  vr::DriverPose_t out = p;
+  const Q headFromImu{p.qDriverFromHeadRotation.w, -p.qDriverFromHeadRotation.x, -p.qDriverFromHeadRotation.y,
+                      -p.qDriverFromHeadRotation.z};
+  double arm[3];  // IMU origin to head origin, driver frame
+  rotate(p.qRotation, p.vecDriverFromHeadTranslation, arm);
+  double spin[3], swing[3], swung[3];  // angular velocity in the driver frame; its effect at the head
+  rotate(p.qRotation, p.vecAngularVelocity, spin);
+  cross(spin, arm, swing);
+  cross(spin, swing, swung);
+  out.qRotation = mul(p.qRotation, p.qDriverFromHeadRotation);
+  out.qDriverFromHeadRotation = Q{1, 0, 0, 0};
+  for (int i = 0; i < 3; ++i) {
+    out.vecPosition[i] = p.vecPosition[i] + arm[i];
+    out.vecDriverFromHeadTranslation[i] = 0;
+    out.vecVelocity[i] = p.vecVelocity[i] + swing[i];
+    out.vecAcceleration[i] = p.vecAcceleration[i] + swung[i];
+  }
+  rotate(headFromImu, p.vecAngularVelocity, out.vecAngularVelocity);
+  rotate(headFromImu, p.vecAngularAcceleration, out.vecAngularAcceleration);
+  return out;
+}
+
+// What the headset's GetPose returns when our driver tracks it through the stock driver's device,
+// for other drivers that ask (Bigscreen's eye tracking driver does): the last pose ours published,
+// as InHeadFrame. The stock driver doesn't track the headset, so its own pose is a placeholder;
+// it's asked only until ours has published one. Forgotten whenever the host activates or
+// deactivates the device, and closed for good on cleanup.
+class PublishedPose {
+ public:
+  // Activate (true) / Deactivate (false): forget the last pose either way.
+  void SetActive(bool active) {
+    std::lock_guard lock(mutex_);
+    active_ = active && !closed_;
+    pose_.reset();
+  }
+  // From our driver's thread, after each pose it publishes. Ignored while not active.
+  void Publish(const vr::DriverPose_t& pose) {
+    std::lock_guard lock(mutex_);
+    if (active_) pose_ = pose;
+  }
+  // GetPose: the last pose ours published, in the head frame. Before there is one, stock() (the
+  // stock driver's GetPose), called under the lock so Close can't happen meanwhile. After Close, an
+  // invalid, disconnected pose.
+  template <class Stock>
+  vr::DriverPose_t Get(Stock stock) const {
+    std::lock_guard lock(mutex_);
+    if (closed_) return Closed();
+    if (pose_) return InHeadFrame(*pose_);
+    return stock();
+  }
+  // Before the stock provider's Cleanup, after which its device may be gone: other drivers can
+  // still call GetPose from their own threads until the host unloads them. Waits for a stock()
+  // call in progress.
+  void Close() {
+    std::lock_guard lock(mutex_);
+    closed_ = true;
+    active_ = false;
+    pose_.reset();
+  }
+
+ private:
+  static vr::DriverPose_t Closed() {
+    vr::DriverPose_t p{};
+    p.qRotation = p.qWorldFromDriverRotation = p.qDriverFromHeadRotation = {1, 0, 0, 0};
+    p.result = vr::TrackingResult_Uninitialized;
+    p.poseIsValid = false;
+    p.deviceIsConnected = false;
+    return p;
+  }
+  mutable std::mutex mutex_;
+  bool active_ = false;
+  bool closed_ = false;
+  std::optional<vr::DriverPose_t> pose_;
+};
 
 class StockHmd {
  public:
@@ -50,7 +149,8 @@ class StockHmd {
 
   // A headset the stock driver added and the host activated: (serial, object id). alive
   // stays valid for the process's life and turns false when the host deactivates it.
-  struct Activated { std::string serial; uint32_t objectId; const std::atomic<bool>* alive; };
+  // published: where our driver hands each pose it publishes for it (same life as alive).
+  struct Activated { std::string serial; uint32_t objectId; const std::atomic<bool>* alive; PublishedPose* published; };
   std::optional<Activated> TakeActivated();
   // Our driver publishes this device's pose from now on: drop the stock driver's.
   void OwnPose(uint32_t objectId);

@@ -43,6 +43,14 @@ class MultiDisambiguator {
   void OnPulse(int sensor, double t, double width);
   void Advance(double t);
   bool Active() const { return active_; }
+  // The room's layout, shared between the devices of a session: whether the stations run a
+  // multi-station round. A device that knows it doesn't have to find it from its own light.
+  bool LayoutKnown() const { return layoutKnown_; }
+  void SetLayoutKnown(bool known) {
+    if (mode_ != Mode::Auto) return;
+    layoutKnown_ = known;
+    active_ = known;
+  }
 
   bool PopFrame(OpticalFrame* out);
   bool PopBaseConfig(BaseConfig* cfg, BaseDynamicState* dyn);
@@ -61,6 +69,7 @@ class MultiDisambiguator {
     uint32_t serial = 0;
     int uniqueId = 0;
     int mode = 0, multiN = 0, multiSlot = -1;
+    bool ootxStock = false;  // its OOTX (decoded or recalled) says a stock station: not the multi layout
     // Of the last 128 groups: present / swept after.
     std::deque<uint8_t> presence;
     int flashes = 0, sweeps = 0;
@@ -89,6 +98,8 @@ class MultiDisambiguator {
   Mode mode_;
   double widthOffset_ = 0;
   bool active_ = false;
+  // The room runs a multi-station round: once detected, kept through a reset (sync lost).
+  bool layoutKnown_ = false;
   int multiVotes_ = 0, stockVotes_ = 0, lowShareVotes_ = 0;
 
   // Pulse store (all pulses of the last ~50 ms; sweeps are read back from it).

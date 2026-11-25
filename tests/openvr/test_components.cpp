@@ -1,5 +1,6 @@
 #include "common/test_paths.hpp"
 #include <array>
+#include <atomic>
 #include <Eigen/Geometry>
 #include <gtest/gtest.h>
 #include "openvr/hand_skeleton.hpp"
@@ -10,10 +11,20 @@
 #include <set>
 #include <sstream>
 #include "openvr/room_publisher.hpp"
+#ifdef _WIN32
+#include <windows.h>
+#undef SendMessage  // IVRMailbox::SendMessage, below
+#elif defined(__linux__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include "openvr/host_frame.hpp"
 #include "openvr/haptic_routing.hpp"
 #include "openvr/telemetry_server.hpp"
 #include "openvr/watchdog.hpp"
+#include "openvr/device_abi.hpp"
+#include "openvr/stock_hmd.hpp"
 #include "openvr/pairing_mailbox.hpp"
 #include "lh/session.hpp"
 #include <cstring>
@@ -316,6 +327,56 @@ TEST(RawAlignment, PreservesHostFrameAcrossRoomRebuild) {
   EXPECT_TRUE(alignment.RoomId().empty());
 }
 
+#if defined(__linux__) || defined(_WIN32)
+// What a reader (an alignment tool) sees: the room under its published name, same layout on
+// Linux and Windows, with a live beat until the driver closes it.
+TEST(RoomPublisher, PublishesTheRoomWhereReadersLookForIt) {
+  lh::SessionSnapshot snapshot;
+  snapshot.roomId = "room-test";
+  lh::BaseStationState base;
+  base.serial = "LHB-A101B835"; base.id = 0xA101B835; base.known = base.seen = base.origin = true;
+  base.worldFromBase.orientation = {1, 0, 0, 0};
+  base.worldFromBase.position = {1, 2, 3};
+  snapshot.bases.push_back(base);
+  lh::openvr::RoomPublisher publisher;
+  publisher.Publish(snapshot, Eigen::Isometry3d::Identity(), 0);
+#ifdef _WIN32
+  HANDLE mapping = OpenFileMappingA(FILE_MAP_READ, FALSE, OPENHOUSE_ROOM_WIN32_NAME);
+  ASSERT_NE(mapping, nullptr);
+  const auto* room = static_cast<const openhouse_room*>(MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, sizeof(openhouse_room)));
+  const int pid = int(GetCurrentProcessId());
+#else
+  const std::string path = OPENHOUSE_ROOM_PATH_PREFIX + std::to_string(unsigned(getuid()));
+  const int fd = shm_open(path.c_str(), O_RDONLY, 0);
+  ASSERT_GE(fd, 0);
+  void* m = mmap(nullptr, sizeof(openhouse_room), PROT_READ, MAP_SHARED, fd, 0);
+  close(fd);
+  ASSERT_NE(m, MAP_FAILED);
+  const auto* room = static_cast<const openhouse_room*>(m);
+  const int pid = int(getpid());
+#endif
+  ASSERT_NE(room, nullptr);
+  EXPECT_EQ(room->magic, OPENHOUSE_ROOM_MAGIC);
+  EXPECT_EQ(room->version, uint32_t(OPENHOUSE_ROOM_VERSION));
+  EXPECT_EQ(room->pid, pid);
+  EXPECT_EQ(room->seq % 2, 0u);
+  EXPECT_GT(room->beat, 0);
+  EXPECT_STREQ(room->room, "room-test");
+  ASSERT_EQ(room->count, 1);
+  EXPECT_STREQ(room->bases[0].serial, "LHB-A101B835");
+  EXPECT_EQ(room->bases[0].origin, 1);
+  EXPECT_DOUBLE_EQ(room->bases[0].p[2], 3);
+  publisher.Close();
+  EXPECT_EQ(room->beat, 0);  // still mapped here: readers see the driver left
+#ifdef _WIN32
+  UnmapViewOfFile(room);
+  CloseHandle(mapping);
+#else
+  munmap(m, sizeof(openhouse_room));
+#endif
+}
+#endif
+
 TEST(RoomPublisher, SettlesAfterTheRoomStopsMovingAndBumpsTheEpochOnARealChange) {
   using lh::openvr::RoomSettle;
   RoomSettle s;
@@ -514,7 +575,7 @@ TEST(LogLevels, ClassifiesAndParses) {
   EXPECT_STREQ(lh::LogLevelName(lh::LogLevel::Error), "ERR");
 }
 
-// SteamVR's rooms (#82): our room written into lighthousedb.json as a universe of its own,
+// SteamVR's rooms: our room written into lighthousedb.json as a universe of its own,
 // beside SteamVR's (kept as they were), placed where the host frame has its bases; never
 // taken back as one of SteamVR's (import or alignment).
 TEST(SteamRooms, WritesOurUniverseAndLeavesSteamVRsAlone) {
@@ -577,7 +638,7 @@ TEST(SteamRooms, ReadsChaperoneUniverses) {
   EXPECT_TRUE(lh::openvr::ChaperoneUniverses(path).empty());
 }
 
-// #91: a tracker or controller on a charging cable shows up on USB while off, so plugging it in doesn't
+// A tracker or controller on a charging cable shows up on USB while off, so plugging it in doesn't
 // start SteamVR; a headset (the Bigscreen Beyond is the same 28de:2300 as a Vive tracker) or a device SteamVR
 // has no config for does. Configs as SteamVR caches them (config/lighthouse/<serial>/config.json).
 TEST(Watchdog, APluggedInTrackerOrControllerIsCharging) {
@@ -650,6 +711,7 @@ struct PairingSession : lh::Session {
   void SetOutputTuning(double, double, bool) override {}
   void SetMixedLight(const lh::MixedLightOptions&) override {}
   std::vector<Receiver> Receivers() const override { return receivers; }
+  bool SetReceiverName(const std::string&, const std::string&) override { return false; }
   bool SetPairing(const std::string& receiver, double seconds) override {
     pairing.emplace_back(receiver, seconds);
     return true;
@@ -745,4 +807,257 @@ TEST(PairingMailbox, AKeepAliveKeepsWhatWasOnTheReceiver) {
   pairing.Poll(session, "");
   ASSERT_EQ(mailbox.Results(), std::vector<std::string>{"success"});
   EXPECT_EQ(mailbox.sent.back().value("connectedSerial", ""), "LHR-12CB1821");
+}
+
+namespace {
+// One of our devices, with a pose to recognize.
+struct PoseDevice : vr::ITrackedDeviceServerDriver {
+  vr::DriverPose_t pose{};
+  vr::EVRInitError Activate(uint32_t) override { return vr::VRInitError_None; }
+  void Deactivate() override {}
+  void EnterStandby() override {}
+  void* GetComponent(const char*) override { return nullptr; }
+  void DebugRequest(const char*, char* response, uint32_t size) override {
+    if (size) response[0] = 0;
+  }
+  vr::DriverPose_t GetPose() override { return pose; }
+};
+
+// A pointer as another binary hands it over: the optimizer may not lean on what it was cast from
+// (calling through a reinterpret_cast to an unrelated class is only well-defined across binaries).
+template <class T>
+T* Opaque(T* p) {
+#if defined(__GNUC__)
+  asm volatile("" : "+r"(p));
+#endif
+  return p;
+}
+
+// A device as MSVC builds it: slot 5 (GetPose) takes `this` first and the result pointer second.
+struct MsvcBuiltDevice {
+  void** vtable;
+  vr::DriverPose_t pose;
+};
+vr::DriverPose_t* MsvcBuiltGetPose(MsvcBuiltDevice* self, vr::DriverPose_t* out) {
+  *out = self->pose;
+  return out;
+}
+}  // namespace
+
+// Other drivers, built with MSVC, call GetPose on our devices: Bigscreen's eye tracking driver does
+// on the headset, and a MinGW build's GetPose took its result buffer for the device and crashed
+// vrserver. What the host is given must take the result pointer after `this`, as MSVC passes it.
+TEST(DeviceAbi, GetPoseInTheHostsOrder) {
+  PoseDevice device;
+  device.pose.vecPosition[0] = 1.5;
+  device.pose.poseIsValid = true;
+  lh::openvr::DeviceForHost forHost(&device);
+  vr::ITrackedDeviceServerDriver* host = Opaque(forHost.Host());
+  if constexpr (lh::openvr::kMsvcGetPoseOrder) {
+    // What MSVC code does for host->GetPose(): slot 5, `this` first, the result pointer second.
+    using MsvcGetPose = vr::DriverPose_t* (*)(void* self, vr::DriverPose_t* out);
+    void** vtable = *reinterpret_cast<void***>(host);
+    vr::DriverPose_t out;
+    std::memset(&out, 0xcc, sizeof out);  // an MSVC debug build's uninitialized stack
+    vr::DriverPose_t* returned = reinterpret_cast<MsvcGetPose>(vtable[5])(host, &out);
+    EXPECT_EQ(returned, &out);
+    EXPECT_EQ(out.vecPosition[0], 1.5);
+    EXPECT_TRUE(out.poseIsValid);
+    // The other slots still reach the device.
+    EXPECT_EQ(host->Activate(3), vr::VRInitError_None);
+  } else {
+    EXPECT_EQ(host, &device);  // same compiler as the host: the device itself
+  }
+}
+
+// The stock headset we wrap is the stock driver's, built with MSVC: we call its GetPose its way.
+TEST(DeviceAbi, GetPoseOfAnotherDriversDevice) {
+  if constexpr (!lh::openvr::kMsvcGetPoseOrder) GTEST_SKIP() << "built with the host's compiler";
+  void* vtable[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, reinterpret_cast<void*>(&MsvcBuiltGetPose)};
+  MsvcBuiltDevice device{vtable, {}};
+  device.pose.vecPosition[2] = -0.25;
+  device.pose.result = vr::TrackingResult_Running_OK;
+  const vr::DriverPose_t pose = lh::openvr::GetPoseFromOtherDriver(
+      Opaque(reinterpret_cast<vr::ITrackedDeviceServerDriver*>(&device)));
+  EXPECT_EQ(pose.vecPosition[2], -0.25);
+  EXPECT_EQ(pose.result, vr::TrackingResult_Running_OK);
+}
+
+// The headset's GetPose returns the pose our driver published for it once there is one (other
+// drivers ask: Bigscreen's eye tracking; the stock driver's own is a placeholder), and never one
+// from before an activation or after a deactivation.
+TEST(PublishedPose, OnlyWhileActiveAndOnlyOncePublished) {
+  lh::openvr::PublishedPose published;
+  vr::DriverPose_t pose{};
+  pose.qRotation = pose.qWorldFromDriverRotation = pose.qDriverFromHeadRotation = {1, 0, 0, 0};
+  pose.vecPosition[1] = 1.7;
+  pose.poseIsValid = true;
+  pose.deviceIsConnected = true;
+  const auto stock = [] {  // the stock driver's placeholder
+    vr::DriverPose_t p{};
+    p.vecPosition[2] = -2;
+    p.result = vr::TrackingResult_Calibrating_InProgress;
+    return p;
+  };
+  // What GetPose returns: ours (true) or the stock driver's (false).
+  const auto ours = [&] {
+    const vr::DriverPose_t p = published.Get(stock);
+    EXPECT_EQ(p.poseIsValid, p.vecPosition[1] == 1.7);
+    return p.vecPosition[1] == 1.7;
+  };
+
+  published.Publish(pose);  // not activated yet
+  EXPECT_FALSE(ours());
+  published.SetActive(true);
+  EXPECT_FALSE(ours());  // nothing published since: the stock driver's
+  published.Publish(pose);
+  EXPECT_TRUE(ours());
+
+  published.SetActive(false);  // deactivated: that pose isn't the device's any more
+  EXPECT_FALSE(ours());
+  published.Publish(pose);  // one late publish from our thread
+  EXPECT_FALSE(ours());
+
+  published.SetActive(true);  // activated again: nothing until we publish
+  EXPECT_FALSE(ours());
+}
+
+// What other drivers get from the headset's GetPose: the same head pose, with qRotation the head's
+// rotation (Bigscreen's eye tracking driver reads only that) and no head offset left to apply.
+TEST(PublishedPose, InHeadFrameKeepsTheHeadPose) {
+  using Eigen::Quaterniond;
+  using Eigen::Vector3d;
+  vr::DriverPose_t p{};
+  const Quaterniond imu = Quaterniond(0.4, -0.3, 0.8, 0.2).normalized();
+  const Quaterniond imuFromHead = Quaterniond(0.0, 0.0, 0.995134, 0.09853).normalized();  // a Beyond's
+  const Vector3d position(0.3, 1.6, -0.4), offset(0.01, 0.05, 0.08), spin(0.5, -2.0, 0.25);  // spin: IMU frame
+  p.qRotation = {imu.w(), imu.x(), imu.y(), imu.z()};
+  p.qDriverFromHeadRotation = {imuFromHead.w(), imuFromHead.x(), imuFromHead.y(), imuFromHead.z()};
+  p.qWorldFromDriverRotation = {1, 0, 0, 0};
+  for (int i = 0; i < 3; ++i) {
+    p.vecPosition[i] = position[i];
+    p.vecDriverFromHeadTranslation[i] = offset[i];
+    p.vecAngularVelocity[i] = spin[i];
+  }
+  p.poseIsValid = true;
+  p.result = vr::TrackingResult_Running_OK;
+
+  const vr::DriverPose_t h = lh::openvr::InHeadFrame(p);
+  const Quaterniond head(h.qRotation.w, h.qRotation.x, h.qRotation.y, h.qRotation.z);
+  EXPECT_LT(head.angularDistance(imu * imuFromHead), 1e-9);
+  EXPECT_EQ(h.qDriverFromHeadRotation.w, 1);
+  EXPECT_EQ(h.qDriverFromHeadRotation.x, 0);
+  const Vector3d headPosition = position + imu * offset;
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_NEAR(h.vecPosition[i], headPosition[i], 1e-12);
+    EXPECT_EQ(h.vecDriverFromHeadTranslation[i], 0);
+  }
+  // The same spin, seen from the head frame; the head's origin moves with it.
+  const Vector3d headSpin = imuFromHead.conjugate() * spin;
+  const Vector3d swing = (imu * spin).cross(imu * offset);
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_NEAR(h.vecAngularVelocity[i], headSpin[i], 1e-12);
+    EXPECT_NEAR(h.vecVelocity[i], swing[i], 1e-12);
+  }
+  EXPECT_TRUE(h.poseIsValid);
+  EXPECT_EQ(h.result, vr::TrackingResult_Running_OK);
+  // A nod (about the head's +X) turns qRotation about the head's +X, not the IMU's.
+  const Quaterniond nod(Eigen::AngleAxisd(0.3, Vector3d::UnitX()));
+  vr::DriverPose_t q = p;
+  const Quaterniond nodded = imu * imuFromHead * nod * imuFromHead.conjugate();
+  q.qRotation = {nodded.w(), nodded.x(), nodded.y(), nodded.z()};
+  const vr::DriverPose_t hn = lh::openvr::InHeadFrame(q);
+  const Quaterniond turn = head.conjugate() * Quaterniond(hn.qRotation.w, hn.qRotation.x, hn.qRotation.y, hn.qRotation.z);
+  EXPECT_LT(turn.angularDistance(nod), 1e-9);
+}
+
+// The headset's GetPose asks the stock driver only until ours publishes, and never after cleanup:
+// the stock driver's device may be gone by then, while other drivers' threads still call it.
+TEST(PublishedPose, NeverAsksTheStockDriverAfterClose) {
+  lh::openvr::PublishedPose published;
+  int stockCalls = 0;
+  const auto stock = [&stockCalls] {
+    ++stockCalls;
+    vr::DriverPose_t p{};
+    p.result = vr::TrackingResult_Calibrating_InProgress;  // the stock driver's placeholder
+    return p;
+  };
+  EXPECT_EQ(published.Get(stock).result, vr::TrackingResult_Calibrating_InProgress);
+  EXPECT_EQ(stockCalls, 1);
+
+  vr::DriverPose_t pose{};
+  pose.qRotation = pose.qWorldFromDriverRotation = pose.qDriverFromHeadRotation = {1, 0, 0, 0};
+  pose.poseIsValid = pose.deviceIsConnected = true;
+  pose.result = vr::TrackingResult_Running_OK;
+  published.SetActive(true);
+  published.Publish(pose);
+  EXPECT_TRUE(published.Get(stock).poseIsValid);
+  EXPECT_EQ(stockCalls, 1);
+
+  published.Close();
+  const vr::DriverPose_t closed = published.Get(stock);
+  EXPECT_FALSE(closed.poseIsValid);
+  EXPECT_FALSE(closed.deviceIsConnected);
+  EXPECT_EQ(closed.qRotation.w, 1);
+  published.SetActive(true);  // a late activation doesn't open it again
+  published.Publish(pose);
+  EXPECT_FALSE(published.Get(stock).poseIsValid);
+  EXPECT_EQ(stockCalls, 1);
+}
+
+// Cleanup closes it before the stock provider's Cleanup; a GetPose already inside the stock driver
+// finishes first.
+TEST(PublishedPose, CloseWaitsForACallInTheStockDriver) {
+  lh::openvr::PublishedPose published;
+  std::atomic<bool> inside{false}, left{false};
+  std::thread caller([&] {
+    published.Get([&] {
+      inside = true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      left = true;
+      return vr::DriverPose_t{};
+    });
+  });
+  while (!inside) std::this_thread::yield();
+  published.Close();
+  EXPECT_TRUE(left);
+  caller.join();
+}
+
+// The open hand without the controller settles by how the controller is held, as stock's does (its
+// rest pose blends hand_right_poses frames 0, 8 and 9 by the hand's tilt): turned palm up and palm
+// down, the open hand differs, and held one way it settles over a fraction of a second, not at once.
+TEST(Skeleton, OpenHandRestsByHowTheControllerIsHeld) {
+  const char* file = std::getenv("LH_HAND_POSES");
+  if (!file) GTEST_SKIP() << "set LH_HAND_POSES to Valve's installed vr_glove_right_poses.glb";
+  lh::openvr::HandSkeleton h;
+  std::string error;
+  ASSERT_TRUE(h.Load(file, false, &error)) << error;
+  if (!error.empty()) GTEST_SKIP() << error;   // no shared hand animations: no rest poses
+  const lh::ControllerInput open{};
+  const auto settled = [&](const Eigen::Quaterniond& q) {
+    h.SetOrientation({q.w(), q.x(), q.y(), q.z()});
+    for (int i = 0; i < 100; ++i) h.Update(open, 0.02);
+    return h.Current(false);
+  };
+  const auto spread = [](const lh::openvr::HandSkeleton::Bones& a, const lh::openvr::HandSkeleton::Bones& b) {
+    double worst = 0;
+    for (int i = 1; i < 26; ++i) {
+      const Eigen::Quaterniond qa(a[i].orientation.w, a[i].orientation.x, a[i].orientation.y, a[i].orientation.z);
+      const Eigen::Quaterniond qb(b[i].orientation.w, b[i].orientation.x, b[i].orientation.y, b[i].orientation.z);
+      worst = std::max(worst, qa.angularDistance(qb));
+    }
+    return worst * 57.29577951308232;
+  };
+  const auto level = settled(Eigen::Quaterniond::Identity());
+  const auto up = settled(Eigen::Quaterniond(Eigen::AngleAxisd(M_PI / 2, Eigen::Vector3d::UnitX())));
+  const auto rolled = settled(Eigen::Quaterniond(Eigen::AngleAxisd(M_PI / 2, Eigen::Vector3d::UnitZ())));
+  EXPECT_GT(spread(level, up), 2.0);
+  EXPECT_GT(spread(level, rolled), 2.0);
+  // One step after turning: still close to where it was (a spring, not a jump).
+  h.SetOrientation({1, 0, 0, 0});
+  h.Update(open, 0.011);
+  EXPECT_LT(spread(h.Current(false), rolled), spread(level, rolled) * 0.7);
+  for (const auto& b : rolled)
+    for (float v : {b.orientation.w, b.orientation.x, b.orientation.y, b.orientation.z}) EXPECT_TRUE(std::isfinite(v));
 }

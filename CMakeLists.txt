@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(liblighthouse VERSION 1.0.3 LANGUAGES CXX)
+project(liblighthouse VERSION 1.0.4 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -39,7 +39,28 @@ option(LH_BUILD_VIEWER "Build GLFW/OpenGL diagnostic viewer if available" ON)
 option(LH_BUILD_TESTS "Build tests" ON)
 option(LH_BUILD_ORACLE_TESTS "Build tests that dlopen the original driver_lighthouse.so" ON)
 
+set(LIGHTHOUSE_INCLUDE_DIR "$ENV{LIGHTHOUSE_INCLUDE_DIR}" CACHE PATH
+    "Optional ShayBox Lighthouse include directory for checking the BLE ABI")
+if(LIGHTHOUSE_INCLUDE_DIR)
+  set(lighthouse_header "${LIGHTHOUSE_INCLUDE_DIR}/lighthouse.h")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${lighthouse_header}")
+  file(READ "${lighthouse_header}" lighthouse_abi)
+  # 2.1.0 declares two unscoped Unknown enumerators. Rename the error enumerator
+  # in the build copy without changing any of the types or values.
+  string(REPLACE "Unknown = -99," "LighthouseErrorUnknown = -99," lighthouse_abi "${lighthouse_abi}")
+  file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/lh/lighthouse_abi.h"
+       CONTENT "${lighthouse_abi}" @ONLY)
+endif()
+
 include(GNUInstallDirs)
+
+# The build's version stamp (cmake/build_id.cmake), redone on every build: lh/build_id.h for
+# LH_VERSION_STRING, VERSION.txt for the packages. Every target waits for it (end of file).
+add_custom_target(lh_build_id ALL
+  COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT=${CMAKE_CURRENT_BINARY_DIR} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_id.cmake
+  BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/generated/lh/build_id.h ${CMAKE_CURRENT_BINARY_DIR}/generated/lh/build_time.h ${CMAKE_CURRENT_BINARY_DIR}/VERSION.txt
+  COMMENT "Version stamp")
+include_directories(BEFORE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 if(WIN32)
   enable_language(RC)
 endif()
@@ -62,7 +83,7 @@ if(WIN32)
   target_link_libraries(lh_common PUBLIC ws2_32)
 endif()
 
-# ---- lh_report: the bug report zip (driver and openhouse-viewer) ----------------
+# ---- lh_report: the bug report zip (driver and openhouse-overlay) ----------------
 add_library(lh_report STATIC src/report/bug_report.cpp)
 set_target_properties(lh_report PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(lh_report PRIVATE src)
@@ -127,7 +148,8 @@ if(LH_BUILD_USB)
     src/transport/usb/device_config.cpp
     src/transport/usb/raw_capture.cpp
     src/transport/usb/wireless_decoder.cpp
-    src/transport/usb/usb_transport.cpp)
+    src/transport/usb/usb_transport.cpp
+    src/transport/usb/doorman_dongle.cpp)
   add_library(lh::usb ALIAS lh_usb)
   set_target_properties(lh_usb PROPERTIES EXPORT_NAME usb POSITION_INDEPENDENT_CODE ON)
   target_compile_features(lh_usb PUBLIC cxx_std_20)
@@ -146,25 +168,12 @@ if(LH_BUILD_USB)
   install(DIRECTORY src/transport/usb/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/lh/usb FILES_MATCHING PATTERN "*.hpp")
 
   if(LH_BUILD_TOOLS)
-    add_executable(lhtool apps/lhtool/main.cpp)
-    target_link_libraries(lhtool PRIVATE lh_usb lh_tracking lh)
-    # Started by SteamVR each session: warns when an update replaced our driver.
+    # liblh's code is built in (as in the driver), so the tool runs on its own.
+    add_executable(lhtool apps/lhtool/main.cpp $<TARGET_OBJECTS:lh_runtime>)
+    target_include_directories(lhtool PRIVATE include src)
+    target_link_libraries(lhtool PRIVATE lh_usb lh_tracking Ceres::ceres Eigen3::Eigen nlohmann_json::nlohmann_json)
     if(WIN32)
-      # Replaces the .bat + PowerShell installer (Defender flagged that pattern).
-      add_executable(openhouse-installer apps/openhouse-installer/main.cpp)
-      target_link_libraries(openhouse-installer PRIVATE nlohmann_json::nlohmann_json)
-      if(NOT MSVC)  # MSVC starts wmain by itself
-        target_compile_options(openhouse-installer PRIVATE -municode)
-        target_link_options(openhouse-installer PRIVATE -municode)
-      endif()
-    endif()
-    add_executable(openhouse-check WIN32 apps/openhouse-check/main.cpp)
-    target_include_directories(openhouse-check PRIVATE include)
-    if(WIN32)
-      target_link_libraries(openhouse-check PRIVATE winhttp)
-    endif()
-    if(MSVC)
-      target_link_options(openhouse-check PRIVATE /ENTRY:mainCRTStartup)  # a GUI app with main()
+      target_link_libraries(lhtool PRIVATE advapi32)
     endif()
     add_executable(lhcapture apps/lhcapture/main.cpp)
     target_include_directories(lhcapture PRIVATE src)
@@ -256,8 +265,26 @@ endif()
 install(TARGETS lh EXPORT lighthouseTargets LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
 # ---- lhviz: 3D visualizer on top of liblh ---------------------------------------
+option(LH_STATIC_GLFW "Build GLFW from source and link it statically (release packages)" OFF)
+if(LH_BUILD_VIEWER AND LH_STATIC_GLFW)
+  # GLFW loads X11/Wayland/libGL itself at run time: only their headers are needed here,
+  # and users don't need libglfw installed.
+  include(FetchContent)
+  set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+  set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+  set(BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
+  set(BUILD_SHARED_LIBS OFF)
+  FetchContent_Declare(glfw URL https://github.com/glfw/glfw/releases/download/3.4/glfw-3.4.zip
+                       URL_HASH SHA256=b5ec004b2712fd08e8861dc271428f048775200a2df719ccf575143ba749a3e9)
+  FetchContent_MakeAvailable(glfw)
+  set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED})
+endif()
 if(LH_BUILD_VIEWER)
-  find_package(glfw3 QUIET)
+  if(NOT TARGET glfw)
+    find_package(glfw3 QUIET)
+  endif()
   # Some distributions ship GLFW without its CMake package (only glfw3.pc): find it there.
   if(NOT TARGET glfw)
     find_package(PkgConfig QUIET)
@@ -283,17 +310,92 @@ if(LH_BUILD_VIEWER)
       third_party/imgui/imgui_widgets.cpp third_party/imgui/backends/imgui_impl_glfw.cpp
       third_party/imgui/backends/imgui_impl_opengl2.cpp)
     target_include_directories(lh_imgui PUBLIC third_party/imgui)
+    target_compile_definitions(lh_imgui PUBLIC IMGUI_USE_WCHAR32)
     target_link_libraries(lh_imgui PUBLIC glfw OpenGL::GL)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      # Fedora's Noto CJK uses CFF2 outlines, which stb_truetype cannot load.
+      find_package(Freetype REQUIRED)
+      target_sources(lh_imgui PRIVATE third_party/imgui/misc/freetype/imgui_freetype.cpp)
+      target_compile_definitions(lh_imgui PRIVATE IMGUI_ENABLE_FREETYPE)
+      target_link_libraries(lh_imgui PRIVATE Freetype::Freetype)
+    endif()
     target_compile_options(lh_imgui PRIVATE -w)
-    add_executable(lhviz apps/lhviz/main.cpp)
-    target_link_libraries(lhviz PRIVATE lh lh_imgui Eigen3::Eigen)
+    add_executable(lhviz apps/lhviz/main.cpp $<TARGET_OBJECTS:lh_runtime>)
+    target_include_directories(lhviz PRIVATE include)
+    target_link_libraries(lhviz PRIVATE lh_imgui lh_tracking Ceres::ceres Eigen3::Eigen nlohmann_json::nlohmann_json)
+    if(LH_BUILD_USB)
+      target_link_libraries(lhviz PRIVATE lh_usb)
+    endif()
+    if(WIN32)
+      target_link_libraries(lhviz PRIVATE advapi32)
+    endif()
     install(TARGETS lhviz RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
     # openhouse-viewer: the running driver's status and log (telemetry over loopback)
-    add_executable(openhouse-viewer apps/openhouse-viewer/main.cpp apps/openhouse-viewer/telemetry_client.cpp
+    add_executable(openhouse-viewer WIN32 apps/openhouse-viewer/main.cpp apps/openhouse-viewer/telemetry_client.cpp
                    apps/openhouse-viewer/log_view.cpp apps/openhouse-viewer/views.cpp)
     target_include_directories(openhouse-viewer PRIVATE src)
     target_link_libraries(openhouse-viewer PRIVATE lh_common lh_report lh_imgui nlohmann_json::nlohmann_json)
+    if(MSVC)
+      target_link_options(openhouse-viewer PRIVATE /ENTRY:mainCRTStartup)  # a GUI app with main()
+    endif()
     install(TARGETS openhouse-viewer RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    # openhouse-overlay: the management app, a SteamVR dashboard overlay or a window. SteamVR's
+    # OpenVR client library is loaded from the SteamVR install at run time (not linked/shipped).
+    if(OPENVR_INCLUDE_DIR)
+      add_executable(openhouse-overlay WIN32 apps/openhouse-overlay/main.cpp apps/openhouse-overlay/ui.cpp
+                     apps/openhouse-overlay/base_channels.cpp
+                     apps/openhouse-overlay/openvr_runtime.cpp apps/openhouse-overlay/update_check.cpp
+                     apps/openhouse-overlay/driver_check.cpp
+                     apps/openhouse-overlay/telemetry_client.cpp apps/openhouse-overlay/log_view.cpp
+                     apps/openhouse-overlay/views.cpp)
+      target_include_directories(openhouse-overlay PRIVATE src ${OPENVR_INCLUDE_DIR})
+      if(LIGHTHOUSE_INCLUDE_DIR)
+        target_compile_definitions(openhouse-overlay PRIVATE LH_CHECK_LIGHTHOUSE_ABI)
+      endif()
+      target_link_libraries(openhouse-overlay PRIVATE lh_common lh_report lh_imgui nlohmann_json::nlohmann_json ${CMAKE_DL_LIBS})
+      if(WIN32)
+        target_link_libraries(openhouse-overlay PRIVATE winhttp shell32)
+      endif()
+      if(MSVC)
+        target_link_options(openhouse-overlay PRIVATE /ENTRY:mainCRTStartup)  # a GUI app with main()
+      endif()
+      install(TARGETS openhouse-overlay RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
+    # openhouse-installer: installs/uninstalls the driver and flashes openhouse's firmware (base
+    # stations, dongles, device radios), as a guided window. Self-contained: GLFW and ImGui are
+    # linked in (GLFW statically with LH_STATIC_GLFW), and on Linux the C++ runtime too.
+    add_executable(openhouse-installer WIN32 apps/openhouse-installer/main.cpp apps/openhouse-installer/ui.cpp
+                   apps/openhouse-installer/system.cpp apps/openhouse-installer/driver_install.cpp
+                   apps/openhouse-installer/drives.cpp apps/openhouse-installer/radio.cpp
+                   apps/openhouse-installer/device_type.cpp apps/openhouse-installer/self_update.cpp apps/openhouse-installer/shortcuts.cpp
+                   src/common/nordic_dfu.cpp)
+    target_include_directories(openhouse-installer PRIVATE include src apps/openhouse-overlay)
+    target_link_libraries(openhouse-installer PRIVATE lh_imgui ${LH_HIDAPI_TARGET} nlohmann_json::nlohmann_json)
+    if(WIN32)
+      target_link_libraries(openhouse-installer PRIVATE shell32 ole32 uuid setupapi winhttp)
+    else()
+      target_link_options(openhouse-installer PRIVATE -static-libstdc++ -static-libgcc)
+    endif()
+    if(MSVC)
+      target_link_options(openhouse-installer PRIVATE /ENTRY:mainCRTStartup)
+    endif()
+    install(TARGETS openhouse-installer RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    # doorman-dongle-manager: the Doorman Dongle Manager (slots, pairing, radio telemetry, firmware).
+    # A desktop window; device names from the driver's telemetry when it runs.
+    if(LH_BUILD_USB)
+      add_executable(doorman-dongle-manager WIN32 apps/doorman-dongle-manager/main.cpp apps/doorman-dongle-manager/ui.cpp
+                     apps/doorman-dongle-manager/dongle.cpp apps/openhouse-overlay/telemetry_client.cpp src/common/nordic_dfu.cpp
+                     apps/openhouse-overlay/update_check.cpp)
+      target_include_directories(doorman-dongle-manager PRIVATE src src/transport/usb apps/openhouse-overlay)
+      target_link_libraries(doorman-dongle-manager PRIVATE lh_usb lh_common lh_imgui nlohmann_json::nlohmann_json)
+      if(WIN32)
+        target_link_libraries(doorman-dongle-manager PRIVATE winhttp shell32 setupapi)
+      endif()
+      if(MSVC)
+        target_link_options(doorman-dongle-manager PRIVATE /ENTRY:mainCRTStartup)  # a GUI app with main()
+      endif()
+      install(TARGETS doorman-dongle-manager RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    endif()
     # openhouse-compare: openhouse and SteamVR's own driver tracking side by side
     if(OPENVR_INCLUDE_DIR AND LH_BUILD_USB)
       add_executable(openhouse-compare apps/openhouse-compare/main.cpp apps/openhouse-compare/stock_host.cpp)
@@ -302,7 +404,7 @@ if(LH_BUILD_VIEWER)
       install(TARGETS openhouse-compare RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
     endif()
   else()
-    message(WARNING "LH_BUILD_VIEWER is on, but ${LH_VIEWER_MISSING} wasn't found: lhviz, openhouse-viewer "
+    message(WARNING "LH_BUILD_VIEWER is on, but ${LH_VIEWER_MISSING} wasn't found: lhviz, openhouse-overlay "
                     "and openhouse-compare are not built. Install it, or configure with -DLH_BUILD_VIEWER=OFF.")
   endif()
 endif()
@@ -313,6 +415,8 @@ if(LH_BUILD_TESTS)
   find_package(GTest REQUIRED)
   add_executable(lh_unit_tests
     tests/unit/test_platform.cpp
+    tests/unit/test_version.cpp
+    tests/unit/test_tracker_names.cpp
     tests/unit/test_tracking_source.cpp
     tests/unit/test_pose_solver.cpp
     tests/unit/test_tracker.cpp
@@ -324,14 +428,23 @@ if(LH_BUILD_TESTS)
     tests/unit/test_rotor_reference.cpp
     src/runtime/mixed_light.cpp)
   target_include_directories(lh_unit_tests PRIVATE src)
-  target_link_libraries(lh_unit_tests PRIVATE lh_tracking GTest::gtest_main)
+  target_link_libraries(lh_unit_tests PRIVATE lh_tracking nlohmann_json::nlohmann_json GTest::gtest_main)
   if(WIN32)
-    target_link_libraries(lh_unit_tests PRIVATE advapi32)
+    target_link_libraries(lh_unit_tests PRIVATE advapi32 winhttp)
   endif()
   if(LH_BUILD_USB)
     target_sources(lh_unit_tests PRIVATE tests/unit/test_report_parser.cpp tests/unit/test_device_config.cpp
       tests/unit/test_raw_capture.cpp tests/unit/test_radio_mode.cpp)
     target_link_libraries(lh_unit_tests PRIVATE lh_usb)
+    get_target_property(LH_USB_TARGET_TYPE lh_usb TYPE)
+    if(LH_USB_TARGET_TYPE STREQUAL "STATIC_LIBRARY")
+      # Several Doorman Dongles at once. The test defines hidapi's entry points itself (fake
+      # dongles); they replace the static transport's device calls, so no real device is opened.
+      add_executable(lh_doorman_dongle_tests tests/unit/test_doorman_dongles.cpp)
+      target_link_libraries(lh_doorman_dongle_tests PRIVATE lh_usb GTest::gtest_main)
+      add_test(NAME doorman_dongles COMMAND lh_doorman_dongle_tests)
+      set_tests_properties(doorman_dongles PROPERTIES TIMEOUT 60)
+    endif()
     add_executable(lh_replay_tests tests/integration/test_replay.cpp)
     target_compile_definitions(lh_replay_tests PRIVATE LH_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     target_include_directories(lh_replay_tests PRIVATE tests)
@@ -340,16 +453,27 @@ if(LH_BUILD_TESTS)
   endif()
   add_test(NAME unit COMMAND lh_unit_tests)
   if(TARGET driver_lighthouse)
-    add_executable(lh_openvr_component_tests tests/openvr/test_components.cpp src/openvr/hand_skeleton.cpp src/openvr/raw_alignment.cpp src/openvr/steam_rooms.cpp src/openvr/room_publisher.cpp src/openvr/host_frame.cpp src/openvr/telemetry_server.cpp src/openvr/pairing_mailbox.cpp)
-    target_include_directories(lh_openvr_component_tests PRIVATE src tests ${OPENVR_INCLUDE_DIR})
+    add_library(lh_test_ble SHARED tests/openvr/fake_lighthouse_ble.cpp)
+    add_executable(lh_openvr_component_tests tests/openvr/test_components.cpp tests/openvr/test_base_channels.cpp src/openvr/hand_skeleton.cpp src/openvr/raw_alignment.cpp src/openvr/steam_rooms.cpp src/openvr/room_publisher.cpp src/openvr/host_frame.cpp src/openvr/telemetry_server.cpp src/openvr/pairing_mailbox.cpp apps/openhouse-overlay/base_channels.cpp)
+    target_include_directories(lh_openvr_component_tests PRIVATE src tests apps/openhouse-overlay ${OPENVR_INCLUDE_DIR})
+    target_include_directories(lh_test_ble PRIVATE apps/openhouse-overlay)
+    if(LIGHTHOUSE_INCLUDE_DIR)
+      target_compile_definitions(lh_openvr_component_tests PRIVATE LH_CHECK_LIGHTHOUSE_ABI)
+      target_compile_definitions(lh_test_ble PRIVATE LH_CHECK_LIGHTHOUSE_ABI)
+    endif()
     target_compile_definitions(lh_openvr_component_tests PRIVATE LH_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-    target_link_libraries(lh_openvr_component_tests PRIVATE lh lh_tracking Eigen3::Eigen nlohmann_json::nlohmann_json GTest::gtest_main)
+    target_link_libraries(lh_openvr_component_tests PRIVATE lh lh_tracking Eigen3::Eigen nlohmann_json::nlohmann_json GTest::gtest_main ${CMAKE_DL_LIBS})
+    target_link_libraries(lh_openvr_component_tests PRIVATE lh_test_ble)
+    target_compile_definitions(lh_openvr_component_tests PRIVATE LH_TEST_BLE="$<TARGET_FILE:lh_test_ble>")
     add_test(NAME openvr_components COMMAND lh_openvr_component_tests)
     find_library(OPENVR_API_LIBRARY openvr_api)
     if(OPENVR_API_LIBRARY)
       add_executable(lh_openvr_client_probe tests/openvr/client_probe.cpp)
       target_include_directories(lh_openvr_client_probe PRIVATE ${OPENVR_INCLUDE_DIR})
       target_link_libraries(lh_openvr_client_probe PRIVATE ${OPENVR_API_LIBRARY} Threads::Threads)
+      add_executable(lh_openvr_skeleton_recorder tests/openvr/skeleton_recorder.cpp)
+      target_include_directories(lh_openvr_skeleton_recorder PRIVATE ${OPENVR_INCLUDE_DIR})
+      target_link_libraries(lh_openvr_skeleton_recorder PRIVATE ${OPENVR_API_LIBRARY} Threads::Threads)
     endif()
     add_executable(lh_openvr_host_test tests/openvr/mock_host.cpp)
     target_include_directories(lh_openvr_host_test PRIVATE ${OPENVR_INCLUDE_DIR})
@@ -367,6 +491,19 @@ if(LH_BUILD_TESTS)
   endif()
   target_link_libraries(lh_runtime_tests PRIVATE lh lh_tracking Eigen3::Eigen nlohmann_json::nlohmann_json GTest::gtest_main)
   add_test(NAME runtime COMMAND lh_runtime_tests)
+  # Doorman air codec: every frame of the bundled LH2 capture, batched as the radio does at 8 devices,
+  # must come back exactly (doorman/test, ai/doorman/testing.md). Built as C++: the codec headers are
+  # plain C that compiles either way.
+  if(TARGET lhtool AND NOT MSVC)   # the codec uses GCC/Clang builtins, as the firmware's compiler does
+    add_executable(doorman_codec_roundtrip doorman/test/codec_roundtrip.c)
+    set_source_files_properties(doorman/test/codec_roundtrip.c PROPERTIES LANGUAGE CXX)
+    target_include_directories(doorman_codec_roundtrip PRIVATE doorman/common)
+    add_test(NAME doorman_codec COMMAND ${CMAKE_COMMAND}
+      -DLHTOOL=$<TARGET_FILE:lhtool> -DROUNDTRIP=$<TARGET_FILE:doorman_codec_roundtrip>
+      -DCAPTURE=${CMAKE_CURRENT_SOURCE_DIR}/tests/data/captures/lh2-five-devices/input.lhraw
+      -DFRAMES=${CMAKE_CURRENT_BINARY_DIR}/doorman_codec_frames.bin
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/doorman/test/codec_test.cmake)
+  endif()
   if(TARGET lhcapture)
     add_test(NAME capture_help COMMAND lhcapture --help)
     add_test(NAME capture_bad_duration COMMAND lhcapture --seconds not-a-number)
@@ -409,16 +546,22 @@ foreach(entry
     "driver_lighthouse|openhouse SteamVR lighthouse driver"
     "lhtool|openhouse replay and diagnostics tool"
     "lhcapture|openhouse device recorder"
-    "openhouse-check|openhouse update check"
-    "openhouse-viewer|openhouse viewer"
+    "openhouse-overlay|openhouse overlay|openhouse.ico"
+    "doorman-dongle-manager|Doorman Dongle Manager|dongle-manager.ico"
     "openhouse-compare|openhouse and SteamVR driver comparison"
     "lhviz|openhouse developer viewer"
-    "openhouse-installer|openhouse driver installer")
+    "openhouse-viewer|openhouse driver status viewer"
+    "openhouse-installer|openhouse driver installer|openhouse.ico")
   string(REPLACE "|" ";" parts "${entry}")
   list(GET parts 0 name)
   list(GET parts 1 text)
+  set(icon "")
+  list(LENGTH parts n)
+  if(n GREATER 2)
+    list(GET parts 2 icon)
+  endif()
   if(TARGET ${name})
-    lh_windows_resources(${name} "${text}")
+    lh_windows_resources(${name} "${text}" "${icon}")
   endif()
 endforeach()
 
@@ -432,3 +575,12 @@ install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT lighthouseTargets NAMESPACE lh:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/lighthouse)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/lighthouseConfig.cmake
   ${CMAKE_CURRENT_BINARY_DIR}/lighthouseConfigVersion.cmake DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/lighthouse)
+
+# Everything built here waits for the version stamp (lh/build_id.h).
+get_property(lh_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+foreach(t IN LISTS lh_targets)
+  get_target_property(type ${t} TYPE)
+  if(NOT t STREQUAL "lh_build_id" AND NOT type STREQUAL "INTERFACE_LIBRARY" AND NOT type STREQUAL "UTILITY")
+    add_dependencies(${t} lh_build_id)
+  endif()
+endforeach()

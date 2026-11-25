@@ -18,6 +18,7 @@
 #include <map>
 #include <limits>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -35,7 +36,7 @@ struct RoomBase {
   bool origin = false;
   std::optional<int> resetCount;  // OOTX sys_unlock_count when located
   int inconsistent = 0;           // consecutive observations disagreeing with the map (Observe)
-  int farSolves = 0;              // consecutive room solves far off the map (ApplySolved; #84)
+  int farSolves = 0;              // consecutive room solves far off the map (ApplySolved)
   bool solved = false;            // pose owned by the room solver (no filter blending)
   bool relearn = false;           // bumped this session: the next confident solve is taken whole
   uint32_t epoch = 0;             // bumps each time the base is re-placed (moved, knocked): devices resync
@@ -76,6 +77,9 @@ class RoomMap {
   void SetOotxFrame(uint32_t serial, const std::vector<uint8_t>& frame);
   const std::map<uint32_t, std::vector<uint8_t>>& OotxFrames() const { return frames_; }
 
+  // Keep stored poses while excluding stations whose optical channel is ambiguous.
+  void SetConflictedBases(std::set<uint32_t> bases);
+  bool Conflicted(uint32_t serial) const { return conflictedBases_.contains(serial); }
   const RoomBase* Base(uint32_t serial) const;
   std::vector<RoomBase> Bases() const;
   bool Empty() const;
@@ -111,8 +115,11 @@ class RoomMap {
   // relearned from fresh keyframes. The origin is relearned against another placed
   // base (OriginGauge), so the room, and what devices report in it, stay put.
   void Bump(uint32_t serial, const std::string& why);
+  // A placed base that is still being learned and that the light disagrees with: kept placed
+  // with its keyframes, freed for the solver to refine (unlocked), not relearned from scratch.
+  void Refine(uint32_t serial, const std::string& why);
   bool OriginRelearning() const { return originRelearn_; }
-  uint64_t Bumps() const { return bumps_; }  // counts Bump calls: a solve started before one is stale
+  uint64_t Bumps() const { return bumps_; }  // Movement and channel conflicts invalidate in-flight solves.
   uint32_t OriginGauge() const;  // the base held fixed meanwhile; 0 if none
   void ApplyOriginSolved(const Eigen::Isometry3d& worldFromOrigin, double positionVariance, int keyframes);
   uint64_t OriginEpoch() const { return originEpoch_; }  // bumps when the origin was re-placed
@@ -138,6 +145,7 @@ class RoomMap {
   // accelerometer if the stored level disagrees, the others relearned if it was reset
   bool LevelOrigin(Room& room, RoomBase& origin, const BaseDynamicState& dynamic);  // true: room stale
   static void Suspect(RoomBase& base);
+  void Loosen(RoomBase& base);
   void CheckAccel(uint32_t serial, const BaseDynamicState& dynamic, const Eigen::Vector3d* saved = nullptr);
   void Changed() { ++revision_; dirty_ = true; if (auto* r = ActiveRoom()) r->updated = Now(); }
   static double Now();
@@ -147,6 +155,7 @@ class RoomMap {
   std::map<uint32_t, std::pair<BaseConfig, BaseDynamicState>> configs_;
   std::map<uint32_t, std::vector<uint8_t>> frames_;
   std::map<uint32_t, int> seenResetCount_;  // this session
+  std::set<uint32_t> conflictedBases_;
   std::map<std::string, double> lastObservation_;
   uint64_t revision_ = 0;
   bool dirty_ = false;
@@ -157,8 +166,17 @@ class RoomMap {
   double levelTime_ = std::numeric_limits<double>::quiet_NaN(), advanceTime_ = std::numeric_limits<double>::quiet_NaN();
   std::map<uint32_t, Eigen::Isometry3d> solvedTarget_;
   bool levelled_ = false;  // the session's first level is applied at once
-  struct AccelTrack { Eigen::Vector3d ref = Eigen::Vector3d::Zero(); bool has = false; int strikes = 0; };
+  struct AccelTrack {
+    Eigen::Vector3d ref = Eigen::Vector3d::Zero();
+    bool has = false;
+    bool fromSaved = false;  // ref is still an earlier session's gravity (looser threshold)
+    int strikes = 0;
+  };
   std::map<uint32_t, AccelTrack> accel_;  // this session
+  // The gravity a base had when its pose was learned, kept in the saved room until this session re-places
+  // the base or reads it close to that level. Saving a moved base's new reading with its old pose would
+  // hide the move from every later session.
+  std::map<uint32_t, std::array<float, 3>> keptGravity_;
   bool originRelearn_ = false;
   uint64_t bumps_ = 0;
   uint64_t originEpoch_ = 0;

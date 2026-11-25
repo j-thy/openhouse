@@ -140,7 +140,14 @@ MixedLightStep ChooseLightMode(const LightModeView& v) {
   int want = -1;
   const char* why = nullptr;
   if (v.seenLh1 != v.seenLh2) want = v.seenLh2 ? 1 : 0, why = "room's bases";
-  else if (v.knownLh2 != v.knownLh1 && !v.seenLh1 && !v.seenLh2) want = v.knownLh2 ? 1 : 0, why = "room's bases (known)";
+  else if (v.knownLh2 != v.knownLh1 && !v.seenLh1 && !v.seenLh2) {
+    // SteamVR's database is a guess, not the room: it keeps the bases of an earlier setup (2.0 bases swapped
+    // for 1.0 ones kept every tracker in LH2 mode, blind). Dark that long in its mode, the other is tried for
+    // a while, long enough for a station to be named; light there keeps it.
+    want = v.knownLh2 ? 1 : 0, why = "room's bases (known)";
+    if (v.mode == want && v.inMode >= kKnownProbe) return {1 - want, "nothing in the known room's mode"};
+    if (v.mode != want && v.inMode < kKnownOther) return {};
+  }
   if (want >= 0) {
     if (want != v.mode) return {want, why};
     return v.inMode >= kResend ? MixedLightStep{want, "re-send"} : MixedLightStep{};

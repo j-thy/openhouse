@@ -1,4 +1,6 @@
 #include "raw_alignment.hpp"
+
+#include "platform/platform.hpp"
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -6,7 +8,7 @@
 
 namespace lh::openvr {
 bool RawAlignment::Load(const std::string& path, std::string* error) {
-  std::ifstream f(path);
+  std::ifstream f(lh::platform::FsPath(path));
   if (!f) { if (error) *error = "cannot open reference room " + path; return false; }
   std::ostringstream text; text << f.rdbuf();
   return LoadText(text.str(), error);

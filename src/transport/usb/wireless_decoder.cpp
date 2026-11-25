@@ -195,7 +195,7 @@ bool Wv2Decoder::Decode(uint8_t msb, const uint8_t* p, int n, WirelessPacket* ou
   }
   int len = (f & 0xf) + 1;
   bool doInput = input;
-  // Lengths come from the packet: none may run past its n bytes (#41: a section announced
+  // Lengths come from the packet: none may run past its n bytes (a section announced
   // longer than what was left made the light copy below memcpy a negative length).
   const uint8_t* const end = p + n;
   if (meta) {

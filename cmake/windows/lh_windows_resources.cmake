@@ -1,6 +1,6 @@
 # Windows only: version information (and, for executables, an asInvoker manifest) in
 # each binary. Unsigned binaries without them score worse with Windows Defender.
-#   lh_windows_resources(TARGET "File description")
+#   lh_windows_resources(TARGET "File description" [ICON.ico in cmake/windows])
 function(lh_windows_resources target description)
   if(NOT WIN32)
     return()
@@ -25,6 +25,11 @@ function(lh_windows_resources target description)
     set(LH_RC_FILETYPE VFT_DLL)
     set(LH_RC_FILENAME "${output}.dll")
     set(LH_RC_MANIFEST "")
+  endif()
+  set(LH_RC_ICON "")
+  if(ARGC GREATER 2 AND NOT "${ARGV2}" STREQUAL "")
+    file(TO_CMAKE_PATH "${PROJECT_SOURCE_DIR}/cmake/windows/${ARGV2}" icon)
+    set(LH_RC_ICON "100 ICON \"${icon}\"")  # the lowest id: Explorer's icon for the file
   endif()
   set(rc "${CMAKE_CURRENT_BINARY_DIR}/rc/${target}.rc")
   configure_file("${PROJECT_SOURCE_DIR}/cmake/windows/version.rc.in" "${rc}" @ONLY)

@@ -1,4 +1,6 @@
 #include "hand_skeleton.hpp"
+
+#include "platform/platform.hpp"
 #include <Eigen/Geometry>
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -96,7 +98,7 @@ void FixAux(Bones& out) {
 
 // Every frame of one of Valve's 31-bone hand GLBs, in OpenVR's convention.
 std::vector<Bones> LoadFrames(const std::string& path, bool left) {
-  std::ifstream f(path, std::ios::binary);
+  std::ifstream f(lh::platform::FsPath(path), std::ios::binary);
   if (!f) throw std::runtime_error("cannot open " + path);
   std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), {});
   if (Word(bytes, 0) != 0x46546c67 || Word(bytes, 4) != 2 || Word(bytes, 8) != bytes.size() ||
@@ -208,15 +210,15 @@ bool HandSkeleton::Load(const std::string& path, bool left, std::string* error) 
     // the Index driver's squeeze clip. Without them, the glove library's grip pose
     // stands in for the fist.
     namespace fs = std::filesystem;
-    const fs::path anims = fs::path(path).parent_path();
+    const fs::path anims = lh::platform::FsPath(path).parent_path();
     fs::path shared = anims / ".." / ".." / ".." / ".." / "resources" / "anims";
-    if (const char* dir = std::getenv("LH_HAND_ANIMS")) shared = dir;
+    if (const std::string dir = lh::platform::Env("LH_HAND_ANIMS"); !dir.empty()) shared = lh::platform::FsPath(dir);
     hand_.clear(); close_.clear(); squeeze_.clear();
     try {
-      hand_ = LoadFrames((shared / "hand_right_poses.glb").string(), left);
-      close_ = LoadFrames((shared / "hand_right_closeanim.glb").string(), left);
+      hand_ = LoadFrames(lh::platform::PathUtf8(shared / "hand_right_poses.glb"), left);
+      close_ = LoadFrames(lh::platform::PathUtf8(shared / "hand_right_closeanim.glb"), left);
       if (hand_.size() < 15 || close_.size() < 2) throw std::runtime_error("unexpected hand animations");
-      try { squeeze_ = LoadFrames((anims / "indexcontroller_anim_closesqueeze.glb").string(), left); }
+      try { squeeze_ = LoadFrames(lh::platform::PathUtf8(anims / "indexcontroller_anim_closesqueeze.glb"), left); }
       catch (const std::exception&) { squeeze_.clear(); }
     } catch (const std::exception& e) {
       hand_.clear(); close_.clear(); squeeze_.clear();
@@ -264,9 +266,22 @@ void HandSkeleton::Update(const ControllerInput& in, double seconds) {
     Spring(fingers[f], dt, 250, &s.curl[f], &s.curlV[f]);
     Spring(Bias(fingers[f], kBias[f]), dt, 250, &s.fist[f], &s.fistV[f]);
   }
+  // The open hand at rest, by how the controller is held (0x27ff20's end, from the pose 0x27fcb0 keeps):
+  // the hand frame is the controller's turned 44 deg about -x (cos/sin 22 deg: 0.927, 0.375). Its +z
+  // pointing up blends frame 0 toward frame 8, its -x pointing up adds frame 9, each through a spring.
+  if (haveOrientation_) {
+    const Eigen::Quaterniond q(orientation_[0], orientation_[1], orientation_[2], orientation_[3]);
+    const Eigen::Quaterniond hand = q.normalized() * Eigen::Quaterniond(0.9270064234733582, -0.3750454783439636, 0, 0);
+    const double up = (hand * Eigen::Vector3d(0, 0, 1)).y(), side = (hand * Eigen::Vector3d(-1, 0, 0)).y();
+    const float restUp = up < -1 ? 0.f : up > 1 ? 1.f : float((up + 1) * 0.5);
+    const float restSide = side < 0 ? 0.f : float(std::min(side, 1.0));
+    Spring(restUp, dt, 40, &s.restUp, &s.restUpV);
+    Spring(restSide, dt, 40, &s.restSide, &s.restSideV);
+  }
   s.trigger = finite(in.trigger);
-  // Pulling the trigger closes the index all the way without the controller.
-  Spring(s.trigger > 0 ? 1.f : s.fist[0], dt, 250, &s.indexClose, &s.indexCloseV);
+  // Pulling the trigger closes the index all the way without the controller; on a wand,
+  // which has no finger sensors, as far as it's pulled.
+  Spring(indexFromTrigger_ ? s.trigger : s.trigger > 0 ? 1.f : s.fist[0], dt, 250, &s.indexClose, &s.indexCloseV);
   const float force = finite(in.gripForce);
   s.squeeze = force > 0 ? Bias(std::min(1.f, force), 0.8f) : 0.f;
   // The thumb's close-clip time follows index and middle (0x2803ed..0x2804b7): it
@@ -280,11 +295,14 @@ void HandSkeleton::Update(const ControllerInput& in, double seconds) {
   // moments with nothing touched). Lifted off everything, it rises at once to the
   // open hand's thumb from where it was, and comes down again on the next touch. The
   // left hand mirrors x.
-  constexpr float kThumbMove = 60, kThumbRise = 12, kThumbLower = 30;
+  // Lifting off and settling back both take ~0.2 s (a critically damped spring at 30/s).
+  constexpr float kThumbMove = 60, kThumbRise = 30, kThumbLower = 30;
   const float side = left_ ? -1.f : 1.f;
   bool target = true;
   float tx = 0, ty = 0;
-  if (in.thumbstickTouch || in.thumbstickClick) {
+  // A deflected stick has the thumb on it too, as in ThumbState: a stick whose touch sensor
+  // fails still moves the thumb.
+  if (in.thumbstickTouch || in.thumbstickClick || in.thumbstickX != 0 || in.thumbstickY != 0) {
     tx = Remap(-side * float(in.thumbstickX), -1, 1, 0.2f, 1.f); ty = float(in.thumbstickY);
   } else if (in.trackpadTouch) {
     tx = Remap(-side * float(in.trackpadX), -1, 1, -0.2f, 0.2f); ty = float(in.trackpadY);
@@ -302,7 +320,8 @@ void HandSkeleton::Update(const ControllerInput& in, double seconds) {
   const bool rise = !target;
   Spring(rise ? 1.f : 0.f, dt, rise ? kThumbRise : kThumbLower, &s.thumbRaise, &s.thumbRaiseV);
   s.thumbRaise = std::clamp(s.thumbRaise, 0.f, 1.f);
-  // WithController thumb state machine, cross-faded (0.2 s, 0.9 s back to rest).
+  // WithController thumb state machine, cross-faded in 0.2 s. Stock takes 0.9 s back to rest
+  // (nothing touched): the thumb looked slow to lift off the buttons.
   const int state = ThumbState(in);
   s.padX = -side * float(std::isfinite(in.trackpadX) ? in.trackpadX : 0);
   s.padY = float(std::isfinite(in.trackpadY) ? in.trackpadY : 0);
@@ -313,7 +332,7 @@ void HandSkeleton::Update(const ControllerInput& in, double seconds) {
     s.thumbState = state;
     s.fade = 0;
   }
-  s.fade = std::min(1.f, s.fade + dt / (state == 8 ? 0.9f : 0.2f));
+  s.fade = std::min(1.f, s.fade + dt / 0.2f);
 }
 
 Bones HandSkeleton::ThumbPose(const State& s, bool blended) const {
@@ -322,6 +341,11 @@ Bones HandSkeleton::ThumbPose(const State& s, bool blended) const {
   else if (s.thumbState == 1) target = Grid(glove_, kStickGrid, s.stickX, s.stickY);
   else target = glove_[size_t(kStateFrame[s.thumbState])];
   return blended && s.fade < 1 ? Lerp(s.thumbFrom, target, s.fade) : target;
+}
+
+// The open hand without the controller (0x280e80's first blends): frame 0 toward frame 8, then 9.
+Bones HandSkeleton::Rest(const State& s) const {
+  return Lerp(Lerp(hand_[0], hand_[8], s.restUp), hand_[9], s.restSide);
 }
 
 Bones HandSkeleton::Current(bool withController) const {
@@ -340,7 +364,10 @@ Bones HandSkeleton::Current(bool withController) const {
     Blend(out, open, 1 - s.curl[3], kPinky);
   } else if (!hand_.empty()) {
     // 0x280e80: each finger closes along the fist clip (squeezing, the squeeze clip)
-    out = hand_[0];
+    const Bones rest = Rest(s);
+    out = rest;
+    // The index goes back to frame 0 as the other three close (their mean closure).
+    Blend(out, hand_[0], std::clamp((s.fist[1] + s.fist[2] + s.fist[3]) / 3, 0.f, 1.f), kIndex);
     auto fist = [&](float t) { return squeeze_.empty() ? Sample(close_, t) : Lerp(Sample(close_, t), Sample(squeeze_, t), s.squeeze); };
     Blend(out, fist(s.indexClose), s.indexClose, kIndex);
     Blend(out, fist(s.fist[1]), s.fist[1], kMiddle);
@@ -351,7 +378,7 @@ Bones HandSkeleton::Current(bool withController) const {
     Bones thumb = s.thumbX < 0 ? Lerp(hand_[kThumbRest], fist(s.thumbClose), -s.thumbX)
                                : Lerp(hand_[kThumbRest], hand_[kThumbOut], s.thumbX);
     thumb = s.thumbY < 0 ? Lerp(thumb, hand_[kThumbBack], -s.thumbY) : Lerp(thumb, hand_[kThumbRest], s.thumbY);
-    Blend(out, Lerp(thumb, hand_[0], s.thumbRaise), 1, kThumb);
+    Blend(out, Lerp(thumb, rest, s.thumbRaise), 1, kThumb);
   } else {
     // No shared animations installed: close onto the glove library's grip.
     out = glove_[kOpen];

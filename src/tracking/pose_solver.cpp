@@ -141,7 +141,7 @@ double LineSearchCostOrPenalty(double cost, double alpha) {
   // A non-finite LH2 residual is outside the model domain, not an inexpensive
   // trial. Give it the same ordered penalty as a pose behind the base. Otherwise
   // fa <= fb and fa < fb are both false for NaN, and the line search walks toward
-  // the invalid side until the whole pose becomes NaN (issue #47, finding 3).
+  // the invalid side until the whole pose becomes NaN.
   return std::isfinite(cost) ? cost : (alpha + 1.0) * kBehindPenalty;
 }
 }  // namespace detail

@@ -25,11 +25,13 @@
 #include "device_tracker.hpp"
 #include "index_input.hpp"
 #include "lh/input_sink.hpp"
+#include "runtime/air_experiment.hpp"
 #include "mixed_light.hpp"
 #include "model_scale.hpp"
 #include "room_map.hpp"
 #include "room_solver.hpp"
 #include "rotor_reference.hpp"
+#include "sob_channels.hpp"
 #include "tracking/disambiguator_sob.hpp"
 #include "tracking/tracked_object.hpp"
 
@@ -87,7 +89,7 @@ std::string FirstExisting(const std::vector<std::string>& paths) {
 }
 
 std::string ReadFile(const std::string& path) {
-  std::ifstream in(path);
+  std::ifstream in(platform::FsPath(path));
   std::stringstream s;
   s << in.rdbuf();
   return s.str();
@@ -185,7 +187,12 @@ class SessionImpl final : public Session, public InputSinkBase {
     std::lock_guard lock(mutex_);
     Emit(SessionEventType::Log, "", text, level);
   }
-  explicit SessionImpl(SessionOptions options) : options_(std::move(options)) {}
+  explicit SessionImpl(SessionOptions options) : options_(std::move(options)) {
+    air_ = AirExperiment::FromEnv({
+        [this](const DeviceId& id, const ImuSample& s) { airForward_ = true; OnImu(id, s); airForward_ = false; },
+        [this](const DeviceId& id, const Lh2BeamWord& w) { airForward_ = true; OnLh2BeamWord(id, w); airForward_ = false; },
+        [this](const DeviceId& id, const Lh2SensorWord& w) { airForward_ = true; OnLh2SensorWord(id, w); airForward_ = false; }});
+  }
   ~SessionImpl() override { Stop(); }
 
   bool Start(std::string* error) override;
@@ -205,7 +212,15 @@ class SessionImpl final : public Session, public InputSinkBase {
   std::vector<Receiver> Receivers() const override {
     std::vector<Receiver> out;
     if (usb_)
-      for (const auto& r : usb_->Receivers()) out.push_back({r.serial, r.connected});
+      for (const auto& r : usb_->Receivers()) {
+        Receiver o;
+        o.serial = r.serial; o.connected = r.connected; o.kind = r.kind; o.slot = r.slot; o.paired = r.paired; o.linked = r.linked;
+        o.kBytesPerSec = r.kBytesPerSec; o.framesPerSec = r.framesPerSec; o.lossPercent = r.lossPercent;
+        o.dropsPerSec = r.dropsPerSec; o.rssiDongle = r.rssiDongle; o.rssiDevice = r.rssiDevice;
+        o.devicesOnDongle = r.devicesOnDongle;
+        o.name = r.name; o.keepsName = r.keepsName;
+        out.push_back(o);
+      }
     return out;
   }
   bool SetCapture(const std::string& path) override {
@@ -217,6 +232,9 @@ class SessionImpl final : public Session, public InputSinkBase {
     (void)path;
     return false;
 #endif
+  }
+  bool SetReceiverName(const std::string& receiver, const std::string& name) override {
+    return usb_ && usb_->SetReceiverName(receiver, name);
   }
   bool SetPairing(const std::string& receiver, double seconds) override {
     return usb_ && usb_->SetPairing(receiver, int(std::lround(seconds * 1000)));
@@ -281,19 +299,23 @@ class SessionImpl final : public Session, public InputSinkBase {
     bool scoutCovered = false;  // ScoutCovers, as last logged
     // UpdateLh1Keyframes: as last set on the tracker, and when to look again.
     bool lh1Keyframes = true;
+    bool multiLayout = false;   // what this device's source last said of the multi-station round
     double nextKeyframeCheck = 0;
   };
-  struct Base {
-    BaseConfig config;
-    BaseDynamicState dynamic;
-    bool seen = false;
-  };
+  std::bitset<sob::kChannels> conflictedChannels_;
+  // The stations run a multi-station round (lhbs): a property of the room, not of one device.
+  // One device finding it (or the stations' OOTX saying stock) tells them all, so a device that
+  // lost the stations' sync doesn't fall back to the two-base path on its own.
+  bool roomMulti_ = false;
+  void ShareMultiLayout(const DeviceId& id, Device& d);
 
   // level: as given, else ClassifyLog(text).
   void Emit(SessionEventType type, const std::string& serial, std::string text, std::optional<LogLevel> level = {});
   void Tick() { if (options_.replayPath.empty()) now_ = std::max(now_, SteadyNow()); }
   void Touch(Device& d, double deviceTime);
   void Process(const DeviceId& id, Device& d);
+  void ObserveBaseConfig(const DeviceId& id, const BaseConfig& config, const BaseDynamicState& dynamic);
+  void ApplyBaseCalibration(const SessionBase& base);
   void UpdateLightMode(const DeviceId& id, Device& d);
   void UpdateLh1Keyframes(const DeviceId& id, Device& d);
   void UpdateMixedLight(const DeviceId& id, Device& d);
@@ -311,7 +333,7 @@ class SessionImpl final : public Session, public InputSinkBase {
   void LoadLearnedImu(const std::string& path);
   void ApplyLearnedImu(const DeviceId& id, const std::string& config, TrackedObjectModel* model);
   // SteamVR's learned per-unit IMU calibration (lighthousedb.json "known_objects"), by serial:
-  // used only for a device whose own config has none (#69).
+  // used only for a device whose own config has none.
   struct LearnedImu { std::array<double, 3> accBias{}, accScale{1, 1, 1}, gyroBias{}; bool acc = false, scale = false, gyro = false; };
   std::map<DeviceId, LearnedImu> learnedImu_;
   std::set<DeviceId> learnedImuLogged_;
@@ -347,7 +369,7 @@ class SessionImpl final : public Session, public InputSinkBase {
   SessionOptions options_;
   mutable std::mutex mutex_;
   std::map<DeviceId, Device> devices_;
-  std::map<uint32_t, Base> bases_;
+  std::map<uint32_t, SessionBase> bases_;
   std::map<uint32_t, tdm::TdmDisambiguator::Identity> identities_;
   RoomMap room_;
   std::string roomPath_, settingsPath_, preinitDir_;
@@ -392,6 +414,8 @@ class SessionImpl final : public Session, public InputSinkBase {
   std::thread solver_;
 #ifdef LH_RUNTIME_USB
   std::unique_ptr<usb::UsbTransport> usb_;
+  std::unique_ptr<AirExperiment> air_;   // LH_AIR experiments only
+  bool airForward_ = false;
 #endif
 };
 
@@ -414,7 +438,7 @@ bool SessionImpl::Start(std::string* error) {
   std::string steamDb = options_.steamDatabasePath;
   if (steamDb.empty()) {
     std::vector<std::string> candidates;
-    if (replay) candidates.push_back((std::filesystem::path(options_.replayPath).parent_path() / "lighthousedb.json").string());
+    if (replay) candidates.push_back(platform::PathUtf8(platform::FsPath(options_.replayPath).parent_path() / "lighthousedb.json"));
     else {
       candidates.push_back(platform::SteamConfigDirectory() + "/lighthousedb.json");
 #ifndef _WIN32
@@ -445,7 +469,7 @@ bool SessionImpl::Start(std::string* error) {
   finished_ = false;
   syncSolve_ = replay && !options_.replayRealtime;
   // The solver thread starts only once Start can't fail any more: a failed Start left it
-  // running, and a second Start then terminated on the joinable thread (#49.7).
+  // running, and a second Start then terminated on the joinable thread.
   if (replay) {
 #ifdef LH_RUNTIME_USB
     if (!std::filesystem::exists(options_.replayPath)) {
@@ -501,8 +525,8 @@ bool SessionImpl::Haptic(const std::string& serial, double frequency, double amp
   std::lock_guard lock(mutex_);
   const auto d = devices_.find(serial);
   if (!running_ || !usb_ || !Enabled(serial) || d == devices_.end() || !d->second.attached ||
-      (d->second.info.role != DeviceRole::Controller && !d->second.input) || !std::isfinite(frequency) ||
-      !std::isfinite(amplitude) || !std::isfinite(duration)) return false;
+      (d->second.info.role != DeviceRole::Controller && (!d->second.input || d->second.info.IsTundraTracker())) ||
+      !std::isfinite(frequency) || !std::isfinite(amplitude) || !std::isfinite(duration)) return false;
   usb_->Haptic(serial, frequency, amplitude, duration);
   return true;
 #else
@@ -690,10 +714,10 @@ bool SessionImpl::SetUpDevice(const DeviceId& id, const std::string& config) {
     Eigen::Isometry3d objectFromHead = Eigen::Isometry3d::Identity();
     if (j.contains("head")) AxesRotation(j.at("head"), &objectFromHead);
     else if (j.contains("trackref_from_head")) PoseArray(j.at("trackref_from_head"), &objectFromHead);
-    // Tundra Trackers ship an identity head, so their pose (and model) came out bottom-up
-    // (#40). The stock driver replaces exactly that case (in 0x1dec60): plus_x -1,0,0,
+    // Tundra Trackers ship an identity head, so their pose (and model) came out bottom-up.
+    // The stock driver replaces exactly that case (in 0x1dec60): plus_x -1,0,0,
     // plus_z 0,0,-1 (180 deg about Y), position 0,0,0.001577.
-    if (d.info.manufacturer == "Tundra Labs" && d.info.model == "Tundra Tracker" &&
+    if (d.info.IsTundraTracker() &&
         objectFromHead.isApprox(Eigen::Isometry3d::Identity(), 1e-9)) {
       AxesRotation(json{{"plus_x", {-1.0, 0.0, 0.0}}, {"plus_z", {0.0, 0.0, -1.0}}, {"position", {0.0, 0.0, 0.001577}}},
                    &objectFromHead);
@@ -701,7 +725,7 @@ bool SessionImpl::SetUpDevice(const DeviceId& id, const std::string& config) {
     // Knuckles EV2.0 (development Index controllers) ship a head with no position, and the
     // stock driver gives them the Index controller's (same function, from "EV2.0" in the
     // model number, "Right" for the right one): without it the model came out tilted about
-    // 25 deg and a few cm off the controller (#96).
+    // 25 deg and a few cm off the controller.
     if (d.info.model.find("Knuckles") != std::string::npos && d.info.model.find("EV2.0") != std::string::npos &&
         objectFromHead.translation().isZero(1e-9)) {
       const bool right = d.info.model.find("Right") != std::string::npos;
@@ -718,15 +742,16 @@ bool SessionImpl::SetUpDevice(const DeviceId& id, const std::string& config) {
     d.tracker->SetHoldStill(d.info.role != DeviceRole::Hmd);  // a still head must not freeze the view
     StartMixedLight(d);
     models_[id] = d.tracker->ImuModel();
-    for (const auto& [serial, b] : bases_) d.tracker->OnBaseConfig(b.config, b.dynamic);
+    for (const auto& [serial, b] : bases_)
+      if (!room_.Conflicted(serial)) d.tracker->OnBaseConfig(b.config, b.dynamic);
+    d.tracker->Source().SetMultiLayout(roomMulti_);   // the room's layout, from the devices before it
+    d.multiLayout = roomMulti_;
     PushIdentities();
-    // HTC's trackers report their pogo pins and power button in the wand's input format (the
-    // stock driver reads them with the wand's button ids; libsurvive with the wand's bits), so
-    // they get the wand's decoder. Other makers' trackers (Tundra) keep their inputs ignored.
-    const bool htcTracker = d.info.role == DeviceRole::Tracker &&
-                            (d.info.manufacturer.empty() || Lower(d.info.manufacturer) == "htc");
+    // HTC tracker inputs and the Tundra power button use the wand's button bits.
+    const bool htc = d.info.manufacturer.empty() || Lower(d.info.manufacturer) == "htc";
     if (d.info.role == DeviceRole::Controller) d.input.emplace(d.info.controllerType);
-    else if (htcTracker) d.input.emplace(ControllerType::ViveWand);
+    else if (d.info.role == DeviceRole::Tracker && (htc || d.info.IsTundraTracker()))
+      d.input.emplace(ControllerType::ViveWand);
     else d.input.reset();
     Emit(SessionEventType::DeviceActivated, id,
          id + " activated as " + ToString(d.info.role) + (d.info.model.empty() ? "" : " (" + d.info.model + ")") +
@@ -742,35 +767,35 @@ void SessionImpl::LoadPreinit() {
   if (preinitDir_.empty()) return;
   std::error_code ec;
   std::vector<std::filesystem::path> files;
-  for (const auto& e : std::filesystem::directory_iterator(preinitDir_, ec))
+  for (const auto& e : std::filesystem::directory_iterator(platform::FsPath(preinitDir_), ec))
     if (e.path().extension() == ".json") files.push_back(e.path());
   std::sort(files.begin(), files.end());
   std::lock_guard lock(mutex_);
   for (const auto& file : files) {
-    const std::string config = ReadFile(file.string());
+    const std::string config = ReadFile(platform::PathUtf8(file));
     // The serial: a file named like one (LHR-0704E07A.json, as `lhtool configs` saves
     // them), else the config's own (wired headsets' configs say "LHR-XXXXXXXX").
-    std::string id = file.stem().string();
+    std::string id = platform::PathUtf8(file.stem());
     std::transform(id.begin(), id.end(), id.begin(), [](unsigned char c) { return char(std::toupper(c)); });
     try {
       const json j = json::parse(config);
       if (id.rfind("LHR-", 0) != 0) id = j.value("device_serial_number", "");
     } catch (const std::exception& e) {
-      Emit(SessionEventType::Log, "", "preinit " + file.string() + ": " + e.what(), LogLevel::Warn);
+      Emit(SessionEventType::Log, "", "preinit " + platform::PathUtf8(file) + ": " + e.what(), LogLevel::Warn);
       continue;
     }
     if (id.empty()) {
-      Emit(SessionEventType::Log, "", "preinit " + file.string() + ": no serial (name the file <serial>.json)", LogLevel::Warn);
+      Emit(SessionEventType::Log, "", "preinit " + platform::PathUtf8(file) + ": no serial (name the file <serial>.json)", LogLevel::Warn);
       continue;
     }
     if (devices_.count(id)) continue;
-    preinitFiles_[id] = file.string();
+    preinitFiles_[id] = platform::PathUtf8(file);
     auto& d = devices_[id];
     d.info.serial = id;
     if (SetUpDevice(id, config)) {  // created, not attached: connected but uninitialized until it connects
       // Not a headset: a "connected" one would start the stock driver's display for nothing.
       d.preinitConnected = d.info.role != DeviceRole::Hmd;
-      Emit(SessionEventType::Log, id, id + ": preinitialized from " + file.filename().string() + " (uninitialized)");
+      Emit(SessionEventType::Log, id, id + ": preinitialized from " + platform::PathUtf8(file.filename()) + " (uninitialized)");
     }
   }
 }
@@ -783,9 +808,9 @@ void SessionImpl::UpdatePreinit(const DeviceId& id, const std::string& config) {
     if (json::parse(ReadFile(file->second)) == json::parse(config)) return;
     const std::string temp = file->second + ".tmp";
     {
-      std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+      std::ofstream out(platform::FsPath(temp), std::ios::binary | std::ios::trunc);
       out << config;
-      out.close();  // a write error can show only when the buffer goes out (#43)
+      out.close();  // a write error can show only when the buffer goes out
       if (!out) throw std::runtime_error("cannot write " + temp);
     }
     platform::ReplaceFile(temp, file->second);  // rename doesn't replace a file on Windows
@@ -823,6 +848,7 @@ void SessionImpl::Touch(Device& d, double deviceTime) {
 }
 
 void SessionImpl::OnImu(const DeviceId& id, const ImuSample& sample) {
+  if (air_ && !airForward_) { air_->OnImu(id, sample); return; }
   if (warming_) return;
   std::lock_guard lock(mutex_);
   Tick();
@@ -1075,6 +1101,7 @@ void SessionImpl::OnLightPulse(const DeviceId& id, const LightPulse& pulse) {
 }
 
 void SessionImpl::OnLh2BeamWord(const DeviceId& id, const Lh2BeamWord& word) {
+  if (air_ && !airForward_) { air_->OnBeam(id, word); return; }
   if (warming_) return;
   std::lock_guard lock(mutex_);
   Tick();
@@ -1090,7 +1117,12 @@ void SessionImpl::OnLh2BeamWord(const DeviceId& id, const Lh2BeamWord& word) {
     found->second.lh1Only = false;
     StartMixedLight(found->second);
   }
-  found->second.tracker->OnLh2BeamWord(word);
+  auto& tracker = *found->second.tracker;
+  tracker.OnLh2BeamWord(word);
+  // Associate direct OOTX with this beam word's host time, even if IMU delivery stalls.
+  BaseConfig config;
+  BaseDynamicState dynamic;
+  while (tracker.Source().PopSobBaseConfig(&config, &dynamic)) ObserveBaseConfig(id, config, dynamic);
   // MixedLightOptions::rotorReference: what the word says of its rotor's timing, for the devices in LH1 mode.
   Device& d = found->second;
   if (mixedActive_ && mixed_.rotorReference && d.haveClock && word.channel >= 0 && word.channel < sob::kChannels)
@@ -1100,6 +1132,7 @@ void SessionImpl::OnLh2BeamWord(const DeviceId& id, const Lh2BeamWord& word) {
 }
 
 void SessionImpl::OnLh2SensorWord(const DeviceId& id, const Lh2SensorWord& word) {
+  if (air_ && !airForward_) { air_->OnSensor(id, word); return; }
   if (warming_) return;
   std::lock_guard lock(mutex_);
   Tick();
@@ -1115,7 +1148,7 @@ void SessionImpl::OnInput(const DeviceId& id, const InputReport& report) {
   Tick();
   if (!Enabled(id)) return;
   auto found = devices_.find(id);
-  if (found == devices_.end() || !found->second.input) return;  // no decoder: inputs ignored (non-HTC trackers)
+  if (found == devices_.end() || !found->second.input) return;  // no input decoder for this device
   auto& d = found->second;
   d.input->Apply(report, d.haveClock ? HostTime(d, report.time) : now_);
 }
@@ -1136,7 +1169,9 @@ void SessionImpl::OnBattery(const DeviceId& id, const BatteryReport& b) {
 void SessionImpl::Process(const DeviceId& id, Device& d) {
   if (now_ - lastAdvance_ >= 0.01) { lastAdvance_ = now_; room_.Advance(now_); }
   std::vector<std::pair<BaseConfig, BaseDynamicState>> decoded;
-  d.tracker->Process(&decoded);
+  BaseConfig config;
+  BaseDynamicState dynamic;
+  while (d.tracker->Source().PopBaseConfig(&config, &dynamic)) decoded.emplace_back(config, dynamic);
   tdm::TdmDisambiguator::Identity identity;
   bool newIdentity = false;
   while (d.tracker->Source().PopIdentity(&identity)) {
@@ -1146,29 +1181,9 @@ void SessionImpl::Process(const DeviceId& id, Device& d) {
     stored = identity;
   }
   if (newIdentity) PushIdentities();
-  for (const auto& [config, dynamic] : decoded) {
-    auto& base = bases_[config.serial];
-    const bool first = !base.seen;
-    if (first) {
-      char text[128];
-      std::snprintf(text, sizeof text, "base %08X: firmware %u, gravity %.3f %.3f %.3f", config.serial,
-                    unsigned(dynamic.firmwareVersion), dynamic.accelDir[0], dynamic.accelDir[1], dynamic.accelDir[2]);
-      Emit(SessionEventType::Log, "", text, LogLevel::Debug);
-    }
-    const bool newChannel = dynamic.sobChannel >= 0 && base.dynamic.sobChannel != dynamic.sobChannel;
-    base.config = config;
-    base.dynamic = dynamic;
-    if (newChannel) PushIdentities();  // the other devices identify this LH2 base at once
-    base.seen = true;
-    room_.OnBaseSeen(config, dynamic);
-    for (auto& [otherId, other] : devices_)
-      if (other.tracker && otherId != id) other.tracker->OnBaseConfig(config, dynamic);
-    if (first) {
-      char text[96];
-      std::snprintf(text, sizeof text, "%s seen by %s (mode %d)", BaseName(config.serial).c_str(), id.c_str(), dynamic.mode);
-      Emit(SessionEventType::BaseStationSeen, BaseName(config.serial), text);
-    }
-  }
+  for (const auto& [config, dynamic] : decoded) ObserveBaseConfig(id, config, dynamic);
+  d.tracker->Process();
+  ShareMultiLayout(id, d);
   TakeKeyframes(d);
   CollectLogs(&d);
   const auto out = d.tracker->Output();
@@ -1180,9 +1195,64 @@ void SessionImpl::Process(const DeviceId& id, Device& d) {
   MaybeSave();
 }
 
+void SessionImpl::ObserveBaseConfig(const DeviceId& id, const BaseConfig& config, const BaseDynamicState& dynamic) {
+  const int ch = dynamic.sobChannel;
+  const bool blocked = ch >= 0 && ch < sob::kChannels && conflictedChannels_[ch];
+  if (blocked && (dynamic.cached || !config.valid || config.cal.size() != 14)) return;
+
+  auto& base = bases_[config.serial];
+  if (!base.Accepts(dynamic)) return;
+  if (blocked && base.HasDirectChannel(ch)) {
+    base.channelObservedAt = now_;
+    return;
+  }
+  const bool first = !base.seen;
+  if (first) {
+    char text[128];
+    std::snprintf(text, sizeof text, "base %08X: firmware %u, gravity %.3f %.3f %.3f", config.serial,
+                  unsigned(dynamic.firmwareVersion), dynamic.accelDir[0], dynamic.accelDir[1], dynamic.accelDir[2]);
+    Emit(SessionEventType::Log, "", text, LogLevel::Debug);
+  }
+  const bool newChannel = ch >= 0 &&
+      (first || base.dynamic.sobChannel != ch || base.dynamic.cached != dynamic.cached);
+  const bool wasConflicted = room_.Conflicted(config.serial);
+  base.config = config;
+  base.dynamic = dynamic;
+  base.seen = true;
+  if (ch >= 0 && !dynamic.cached) base.channelObservedAt = now_;
+  if (newChannel) PushIdentities();
+  if (!wasConflicted && !room_.Conflicted(config.serial)) ApplyBaseCalibration(base);
+  if (first) {
+    char text[96];
+    std::snprintf(text, sizeof text, "%s seen by %s (mode %d)", BaseName(config.serial).c_str(), id.c_str(), dynamic.mode);
+    Emit(SessionEventType::BaseStationSeen, BaseName(config.serial), text);
+  }
+}
+
+void SessionImpl::ApplyBaseCalibration(const SessionBase& base) {
+  room_.OnBaseSeen(base.config, base.dynamic);
+  for (auto& [id, device] : devices_)
+    if (device.tracker) device.tracker->OnBaseConfig(base.config, base.dynamic);
+}
+
+void SessionImpl::ShareMultiLayout(const DeviceId& id, Device& d) {
+  const bool mine = d.tracker->Source().MultiLayout();
+  if (mine == d.multiLayout) return;
+  d.multiLayout = mine;
+  if (mine == roomMulti_) return;
+  roomMulti_ = mine;
+  Emit(SessionEventType::Log, "", std::string(mine ? "multi-station round found by " : "stations back in stock mode, seen by ") + id +
+                                      ": told every device");
+  for (auto& [otherId, other] : devices_)
+    if (other.tracker && &other != &d) { other.tracker->Source().SetMultiLayout(mine); other.multiLayout = mine; }
+}
+
 void SessionImpl::TakeKeyframes(Device& d) {
   for (uint32_t base : room_.TakeRelearned()) keyframes_.DropBase(base);
   for (auto& k : d.tracker->TakeKeyframes()) {
+    if (room_.Conflicted(k->primary) ||
+        std::any_of(k->samples.begin(), k->samples.end(), [&](const auto& entry) { return room_.Conflicted(entry.first); }))
+      continue;
     std::optional<Eigen::Isometry3d> pose;
     if (const RoomBase* primary = room_.Base(k->primary)) pose = primary->worldFromBase * k->primaryFromDevice;
     if (keyframes_.Add(std::move(k), pose)) { newKeyframes_ = true; ++addedKeyframes_; }
@@ -1201,7 +1271,7 @@ bool SessionImpl::SolveDue() const {
   if (!room_.Active() || !room_.Origin()) return false;
   // Locating a seen base quickly matters most; refinement can be slower.
   bool missing = false;
-  for (const auto& [serial, b] : bases_) missing |= b.seen && !room_.Base(serial);
+  for (const auto& [serial, b] : bases_) missing |= b.seen && !room_.Conflicted(serial) && !room_.Base(serial);
   return now_ - lastSolve_ >= (missing ? 0.1 : solveInterval_);
 }
 
@@ -1212,6 +1282,21 @@ RoomSolveInput SessionImpl::SolveInput() {
   for (const auto& b : room_.Bases()) in.known[b.serial] = b.worldFromBase;
   // A knocked origin is relearned against another placed base, held fixed meanwhile.
   in.origin = room_.OriginRelearning() && room_.OriginGauge() ? room_.OriginGauge() : room_.Origin();
+  // An origin off this session (a room with a station that's elsewhere or unplugged now):
+  // the solver held every placed base fixed, so one placed wrong (re-aimed while the
+  // origin was off) was never found, and the room fit 2 deg off forever. One placed base
+  // in view, the best placed, holds the gauge instead; the others are solved against it.
+  if (const auto o = bases_.find(in.origin); o == bases_.end() || !o->second.seen || room_.Conflicted(in.origin)) {
+    uint32_t gauge = 0;
+    int best = -1;
+    for (const auto& b : room_.Bases()) {
+      const auto seen = bases_.find(b.serial);
+      if (seen == bases_.end() || !seen->second.seen || b.observations <= best) continue;
+      best = b.observations;
+      gauge = b.serial;
+    }
+    if (gauge) in.origin = gauge;
+  }
   for (const auto& [serial, b] : bases_)
     if (b.config.cal.size() == 14) {
       std::array<double, 14> cal;
@@ -1319,11 +1404,19 @@ bool SessionImpl::LightMovedLockedBase(const RoomSolveOutput& out) {
   // base it relocks too soon can't cycle.
   constexpr double kFloor = 0.015, kFloorPerMetre = 0.01, kRotFloor = 0.75 * M_PI / 180, kSigmas = 4;
   constexpr double kCooldown = 60;
+  constexpr double kBigTurn = 3 * M_PI / 180, kGoodFit = 2e-3;  // rad: see the second rule below
   constexpr int kStrikes = 3, kStrikesOneDevice = 5;  // solves in a row (1-4 s apart)
   constexpr double kOneDeviceSpan = 10;              // s of one device's keyframes of the base
   const uint32_t origin = room_.Origin();
   if (room_.OriginRelearning()) return false;
-  struct Move { double mm, deg; int strikes, rejected = 0, seen = 0; };
+  struct Move { double mm, deg; int strikes, rejected = 0, seen = 0; bool refine = false; };
+  // Known to a few mm, as a base becomes with keyframes from many sides. Short of that, its
+  // pose came from views of one side (a base that overlaps only one other: placed from in front
+  // of it), and keyframes from elsewhere disagree because they are what refines it, not because
+  // it moved. Knocked, it was unplaced and relearned from in front again, over and over
+  // (D7B1AD76 2026-11-24: placed at 17 mm, 39 of 127 keyframes rejected, knocked every time
+  // its user walked away). Those are refined in place instead.
+  constexpr double kKnownVariance = 0.006 * 0.006;
   std::map<uint32_t, Move> moved;
   int others = 0;
   for (const auto& [serial, b] : out.bases) {
@@ -1342,10 +1435,10 @@ bool SessionImpl::LightMovedLockedBase(const RoomSolveOutput& out) {
     // wrong view must not relearn the room.
     const int needDevices = std::min(2, std::max(1, b.checkedDevices));
     // Devices that see it at all: one whose keyframes of it are all rejected is in neither
-    // checkedDevices nor devices, and alone it met a one-device rule (#42).
+    // checkedDevices nor devices, and alone it met a one-device rule.
     if (b.rejected >= 15 && b.rejected * 4 >= b.seen && othersSeen >= 10 && othersRejected * 10 <= othersSeen &&
         b.rejectingDevices >= std::min(2, std::max(1, b.seeingDevices))) {
-      moved[serial] = {0, 0, kStrikes, b.rejected, b.seen};
+      moved[serial] = {0, 0, kStrikes, b.rejected, b.seen, rb->positionVariance > kKnownVariance};
       continue;
     }
     if (b.keyframes <= 0) continue;
@@ -1363,6 +1456,11 @@ bool SessionImpl::LightMovedLockedBase(const RoomSolveOutput& out) {
     if ((dp > std::max(floor, kSigmas * sigma) || dr > std::max(kRotFloor, kSigmas * rsigma)) &&
         b.supportingDevices >= needDevices && b.rejected >= 8 && b.rejected * 8 >= b.seen)
       moved[serial] = {dp * 1e3, dr * 180 / M_PI, b.devices >= 2 ? kStrikes : kStrikesOneDevice};
+    // Turned far more than a solve ever wanders, and fitting well there: moved, rejections or
+    // not. With two bases every keyframe sees both, so a wrong one misfits them all alike and
+    // none stands out to be rejected (Taco 2026-11-15: 5 deg off, rms 35 mrad, 0 rejected).
+    else if (dr > kBigTurn && b.rms < kGoodFit && b.supportingDevices >= needDevices)
+      moved[serial] = {dp * 1e3, dr * 180 / M_PI, b.devices >= 2 ? kStrikes : kStrikesOneDevice};
   }
   // Every other base off at once (3+ bases): the origin moved, not all of them.
   int farOff = 0;
@@ -1370,7 +1468,7 @@ bool SessionImpl::LightMovedLockedBase(const RoomSolveOutput& out) {
   const auto originCooling = lightCooldown_.find(origin);
   const bool originCool = originCooling != lightCooldown_.end() && now_ < originCooling->second;
   if (others >= 2 && farOff == others && int(moved.size()) == others && originCool) {
-    moved.clear();  // the origin was just relearned from this: nothing else is bumped in its place (#42)
+    moved.clear();  // the origin was just relearned from this: nothing else is bumped in its place
   } else if (others >= 2 && farOff == others && int(moved.size()) == others) {
     int strikes = kStrikes;
     for (const auto& [serial, m] : moved) strikes = std::max(strikes, m.strikes);
@@ -1386,6 +1484,11 @@ bool SessionImpl::LightMovedLockedBase(const RoomSolveOutput& out) {
     if (serial == origin) std::snprintf(why, sizeof why, "the light places every other base elsewhere, %d solves running", d.strikes);
     else if (d.rejected) std::snprintf(why, sizeof why, "the light no longer fits it: %d of its %d keyframes rejected, %d solves running", d.rejected, d.seen, d.strikes);
     else std::snprintf(why, sizeof why, "the light places it %.0f mm / %.2f deg away, %d solves running", d.mm, d.deg, d.strikes);
+    if (d.refine) {   // still being learned: refined in place, its keyframes kept
+      room_.Refine(serial, why);
+      lightCooldown_[serial] = now_ + kCooldown;
+      continue;
+    }
     room_.Bump(serial, why);
     lightCooldown_[serial] = now_ + kCooldown;
     bumped = true;
@@ -1409,7 +1512,7 @@ void SessionImpl::SolverMain() {
     lock.lock();
     // A reset meanwhile: solved against the old room. A base bumped meanwhile: solved from
     // keyframes before the knock, it would re-place the base where it was and end the
-    // relearn (#42). The next solve, from the fresh keyframes, is soon.
+    // relearn. The next solve, from the fresh keyframes, is soon.
     if (resets == roomResets_ && bumps == room_.Bumps()) ApplySolve(out);
   }
 }
@@ -1417,15 +1520,37 @@ void SessionImpl::SolverMain() {
 void SessionImpl::PushIdentities() {
   std::vector<tdm::TdmDisambiguator::Identity> all;
   for (const auto& [serial, id] : identities_) all.push_back(id);
-  std::map<int, std::pair<BaseConfig, BaseDynamicState>> channels;  // LH2: one channel per base, every device
-  for (const auto& [serial, b] : bases_)
-    if (b.dynamic.sobChannel >= 0 && b.config.valid && b.config.cal.size() == 14)
-      channels[b.dynamic.sobChannel] = {b.config, b.dynamic};
+  auto channels = ResolveSobChannels(bases_);
+  for (int ch = 0; ch < sob::kChannels; ++ch) {
+    if (channels.blocked[ch] && !conflictedChannels_[ch]) {
+      const auto [first, second] = channels.firstConflict[ch];
+      char text[240];
+      std::snprintf(text, sizeof text,
+                    "Lighthouse 2.0 channel %d conflict: %s and %s. Tracking on this channel is paused. Assign a different channel to one base, then reset the room if its map is wrong.",
+                    ch + 1, BaseName(first).c_str(), BaseName(second).c_str());
+      Emit(SessionEventType::Log, "", text, LogLevel::Warn);
+    } else if (!channels.blocked[ch] && conflictedChannels_[ch]) {
+      Emit(SessionEventType::Log, "", "Lighthouse 2.0 channel " + std::to_string(ch + 1) + " conflict cleared");
+    }
+  }
+  for (uint32_t serial : channels.conflictedBases) {
+    if (room_.Conflicted(serial)) continue;
+    keyframes_.DropBase(serial);
+    lastSolved_.erase(serial);
+  }
+  std::vector<uint32_t> cleared;
+  if (conflictedChannels_.any()) {
+    for (const auto& [serial, base] : bases_)
+      if (room_.Conflicted(serial) && !channels.conflictedBases.contains(serial)) cleared.push_back(serial);
+  }
+  room_.SetConflictedBases(std::move(channels.conflictedBases));
+  conflictedChannels_ = channels.blocked;
   for (auto& [id, d] : devices_)
     if (d.tracker) {
       d.tracker->Source().SetKnownIdentities(all);
-      d.tracker->Source().SetKnownSobChannels(channels);
+      d.tracker->Source().SetKnownSobChannels(channels.known, channels.blocked);
     }
+  for (uint32_t serial : cleared) ApplyBaseCalibration(bases_.at(serial));
 }
 
 void SessionImpl::CollectLogs(Device* d) {
@@ -1507,6 +1632,7 @@ SessionSnapshot SessionImpl::Snapshot() const {
     s.mode = b.dynamic.mode;
     // lhbs multi channels are its slot (1-4 on the display), stock ones A, b, c.
     s.lh2 = b.dynamic.sobChannel >= 0;
+    s.channelObservedAt = b.channelObservedAt;
     if (b.dynamic.sobChannel >= 0) s.channel = std::to_string(b.dynamic.sobChannel + 1);  // LH2: 1-16
     else if (b.dynamic.multiSlot >= 0) s.channel = std::to_string(b.dynamic.multiSlot + 1);
     else if (b.dynamic.mode >= 1 && b.dynamic.mode <= 3) s.channel = std::string(1, "Abc"[b.dynamic.mode - 1]);
@@ -1543,7 +1669,7 @@ std::vector<DeviceUpdate> SessionImpl::Updates() const {
     DeviceUpdate u;
     u.serial = id;
     u.role = d.info.role;
-    // As Snapshot(): a preinitialized device shows connected (not tracking) before it attaches (#49.6).
+    // As Snapshot(): a preinitialized device shows connected (not tracking) before it attaches.
     u.connected = d.preinitConnected || (d.attached && now_ - d.lastData < 1.0);
     u.enabled = Enabled(id);
     u.batteryPercent = d.info.batteryPercent;
@@ -1568,7 +1694,7 @@ std::vector<SessionEvent> SessionImpl::PollEvents() {
 }
 
 void SessionImpl::LoadLearnedImu(const std::string& path) {
-  std::ifstream in(path);
+  std::ifstream in(platform::FsPath(path));
   if (!in) return;
   try {
     const json j = json::parse(in);
@@ -1650,7 +1776,7 @@ void SessionImpl::ApplyLearnedImu(const DeviceId& id, const std::string& config,
 
 void SessionImpl::LoadSettings() {
   if (settingsPath_.empty()) return;
-  std::ifstream in(settingsPath_);
+  std::ifstream in(platform::FsPath(settingsPath_));
   if (!in) return;
   try {
     const json j = json::parse(in);
@@ -1832,7 +1958,7 @@ void SessionImpl::SaveSettings() {
   try {
     json j = json::object();
     {
-      std::ifstream in(settingsPath_);
+      std::ifstream in(platform::FsPath(settingsPath_));
       if (in) j = json::parse(in);
     }
     j["disabledDevices"] = std::vector<std::string>(disabled_.begin(), disabled_.end());
@@ -1840,10 +1966,10 @@ void SessionImpl::SaveSettings() {
     if (target.has_parent_path()) std::filesystem::create_directories(target.parent_path());
     const std::string temp = settingsPath_ + ".tmp";
     {
-      std::ofstream out(temp);
+      std::ofstream out(platform::FsPath(temp));
       out << j.dump(2) << "\n";
       out.close();
-      // A failed write must not replace the good file: its controllers and roles were lost (#43).
+      // A failed write must not replace the good file: its controllers and roles were lost.
       if (!out) throw std::runtime_error("cannot write " + temp);
     }
     platform::ReplaceFile(temp, target);
@@ -1871,7 +1997,10 @@ void SessionImpl::SetDeviceEnabled(const std::string& serial, bool enabled) {
       d.tracker->SetReportAcceleration(reportAcceleration_);
       d.tracker->SetHoldStill(d.info.role != DeviceRole::Hmd);  // a still head must not freeze the view
       StartMixedLight(d);
-      for (const auto& [base, b] : bases_) d.tracker->OnBaseConfig(b.config, b.dynamic);
+      for (const auto& [base, b] : bases_)
+        if (!room_.Conflicted(base)) d.tracker->OnBaseConfig(b.config, b.dynamic);
+      d.tracker->Source().SetMultiLayout(roomMulti_);   // the room's layout, from the devices before it
+      d.multiLayout = roomMulti_;
       PushIdentities();
     }
     d.lastState = TrackingState::Disconnected;
@@ -1906,17 +2035,22 @@ void SessionImpl::ResetRoomLocked(const std::string& why) {
     d.tracker->SetReportAcceleration(reportAcceleration_);
     d.tracker->SetHoldStill(d.info.role != DeviceRole::Hmd);  // a still head must not freeze the view
     StartMixedLight(d);
-    for (const auto& [base, b] : bases_) d.tracker->OnBaseConfig(b.config, b.dynamic);
+    for (const auto& [base, b] : bases_)
+      if (!room_.Conflicted(base)) d.tracker->OnBaseConfig(b.config, b.dynamic);
+    d.tracker->Source().SetMultiLayout(roomMulti_);   // the room's layout, from the devices before it
+    d.multiLayout = roomMulti_;
     d.lastState = TrackingState::Disconnected;
   }
   PushIdentities();
-  // Seen bases are seen again: the first one becomes the new room's origin.
-  for (const auto& [serial, b] : bases_)
-    if (b.seen) room_.OnBaseSeen(b.config, b.dynamic);
+  // The new room has only the bases seen from now on: one switched off stays out instead of
+  // being listed unplaced forever, the room waiting on it (2026-11-24, D7B1AD76 off). Their
+  // calibration stays with the trackers above; each joins the room as its OOTX comes in again,
+  // the first one as the origin.
+  for (auto& [serial, b] : bases_) b.seen = false;
   if (persist_) {
     std::string err;
     // Seen only once it's written: a failed write then looked like the file being
-    // deleted, and reset the room again every second (#43).
+    // deleted, and reset the room again every second.
     if (room_.Save(roomPath_, &err)) {
       room_.ClearDirty();
       roomFileSeen_ = true;

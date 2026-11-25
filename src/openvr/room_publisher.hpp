@@ -69,7 +69,7 @@ class RoomPublisher {
   unsigned long long roomResets_ = 0;
   bool settled_ = false;
   openhouse_room* shm_ = nullptr;
-  void* map_ = nullptr;  // Windows: the file mapping's handle
+  void* mapping_ = nullptr;  // Windows: the file mapping's HANDLE
   bool failed_ = false;
   std::string path_;
 };

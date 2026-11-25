@@ -1,5 +1,7 @@
 #include "telemetry_client.hpp"
 
+#include "common/tracker_names.hpp"
+
 #include <nlohmann/json.hpp>
 
 namespace openhouse::viewer {
@@ -92,6 +94,7 @@ void TelemetryClient::Handle(const std::string& line) {
       Device x;
       x.serial = d.value("serial", "");
       x.role = d.value("role", "");
+      x.name = lh::telemetry::TrackerDisplayName(j, x.serial);   // trackers from the overlay, any device from its dongle
       x.model = d.value("model", "");
       x.hand = d.value("hand", "");
       x.state = d.value("state", "");

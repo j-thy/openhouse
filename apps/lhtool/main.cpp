@@ -3,7 +3,10 @@
 //   lhtool capture OUT.lhraw [SECONDS]   record raw HID reports from all devices
 //   lhtool stats [IN.lhraw | live SECONDS]  decode and print per-device statistics
 //   lhtool inputs [IN.lhraw | live SECONDS] print each device's controller input as it changes
+#include <algorithm>
 #include <chrono>
+#include <deque>
+#include <vector>
 #include <csignal>
 #include <cmath>
 #include <filesystem>
@@ -17,6 +20,7 @@
 #include <string>
 #include <thread>
 
+#include "platform/platform.hpp"
 #include "lh/input_sink.hpp"
 #include "lh/session.hpp"
 #include "lh/tracker.hpp"
@@ -84,16 +88,19 @@ struct StatsSink : lh::InputSinkBase {
     std::map<int, long> channels;
     double firstT = 0, lastT = 0, offset = 0;
     bool hasConfig = false;
+    std::vector<std::pair<double, double>> arrival;   // (device time, host time - device time) per IMU sample
     void Time(double t) {
       if (firstT == 0) firstT = t;
       lastT = t;
     }
   };
   std::map<std::string, Dev> devs;
+  double hostTime = -1;   // the report being decoded (captures only): IMU delay
   void OnDeviceAttached(const lh::DeviceId& d, const std::string& cfg) override { devs[d].hasConfig |= !cfg.empty(); }
   void OnClockOffset(const lh::DeviceId& d, double o) override { devs[d].offset = o; }
   void OnImu(const lh::DeviceId& d, const lh::ImuSample& s) override {
     devs[d].imu++; devs[d].Time(s.time);
+    if (hostTime >= 0) devs[d].arrival.push_back({double(s.time), hostTime - double(s.time)});
     // LH_IMU_DUMP=SERIAL: that device's raw IMU samples to stdout (time ax ay az gx gy gz saturated).
     static const char* dump = std::getenv("LH_IMU_DUMP");
     if (dump && d == dump)
@@ -122,6 +129,30 @@ struct StatsSink : lh::InputSinkBase {
       printf("%s: config=%s imu=%ld (%.0f Hz) pulses=%ld lh2beam=%ld lh2sensor=%ld demod=%ld aux=%ld clockOffset=%.6f\n",
              id.c_str(), d.hasConfig ? "yes" : "no", d.imu, span > 0 ? d.imu / span : 0.0, d.pulses, d.beam,
              d.sensorWords, d.demod, d.aux, d.offset);
+      // IMU delay: how late each sample reached the PC, over the fastest ones in the 2 min around it
+      // (the clocks drift apart slowly, so a floor per window).
+      if (d.arrival.size() > 100) {
+        std::vector<double> late;
+        late.reserve(d.arrival.size());
+        size_t a = 0, b = 0;
+        std::deque<size_t> mins;   // indices, offsets increasing: the window's minimum in front
+        for (size_t i = 0; i < d.arrival.size(); ++i) {
+          const double t = d.arrival[i].first;
+          while (b < d.arrival.size() && d.arrival[b].first <= t + 60) {
+            while (!mins.empty() && d.arrival[mins.back()].second >= d.arrival[b].second) mins.pop_back();
+            mins.push_back(b++);
+          }
+          while (d.arrival[a].first < t - 60) ++a;
+          while (mins.front() < a) mins.pop_front();
+          late.push_back((d.arrival[i].second - d.arrival[mins.front()].second) * 1000);
+        }
+        std::sort(late.begin(), late.end());
+        const auto at = [&](double q) { return late[size_t(q * (late.size() - 1))]; };
+        long over = 0;
+        for (double l : late) over += l > 50;
+        printf("  imu delay over floor: median %.1f ms, p90 %.1f, p99 %.1f, max %.0f; %.2f %% over 50 ms\n", at(0.5), at(0.9),
+               at(0.99), late.back(), 100.0 * over / late.size());
+      }
       if (!d.events.empty()) {
         printf("  events:");
         for (auto& [t, n] : d.events) printf(" 0x%x:%ld", t, n);
@@ -265,7 +296,7 @@ int ConfigsCommand(int argc, char** argv) {
   } sink;
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
-  if (ec) { fprintf(stderr, "lhtool: cannot create %s: %s\n", dir.string().c_str(), ec.message().c_str()); return 1; }
+  if (ec) { fprintf(stderr, "lhtool: cannot create %s: %s\n", lh::platform::PathUtf8(dir).c_str(), ec.message().c_str()); return 1; }
   lh::usb::UsbTransport transport(&sink, {});
   if (!transport.Start()) { fprintf(stderr, "lhtool: no receivers could be opened (close SteamVR/Monado first)\n"); return 1; }
   fprintf(stderr, "waiting %.0f s for devices (turn on the wireless ones now)\n", seconds);
@@ -277,11 +308,11 @@ int ConfigsCommand(int argc, char** argv) {
     const auto path = dir / (serial + ".json");
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out << config;
-    if (!out) { fprintf(stderr, "lhtool: cannot write %s\n", path.string().c_str()); continue; }
-    printf("%s\n", path.string().c_str());
+    if (!out) { fprintf(stderr, "lhtool: cannot write %s\n", lh::platform::PathUtf8(path).c_str()); continue; }
+    printf("%s\n", lh::platform::PathUtf8(path).c_str());
     ++written;
   }
-  fprintf(stderr, "%d device config(s) saved to %s\n", written, dir.string().c_str());
+  fprintf(stderr, "%d device config(s) saved to %s\n", written, lh::platform::PathUtf8(dir).c_str());
   return written ? 0 : 1;
 }
 
@@ -386,7 +417,9 @@ int SessionCommand(int argc, char** argv) {
         const auto& in = *d.input;
         j["input"] = {{"trigger", in.trigger}, {"grip", in.gripForce}, {"stick", {in.thumbstickX, in.thumbstickY}},
                       {"buttons", {{"system", in.systemClick}, {"a", in.aClick}, {"b", in.bClick},
-                                   {"trigger", in.triggerClick}, {"stick", in.thumbstickClick}}},
+                                   {"trigger", in.triggerClick}, {"stick", in.thumbstickClick},
+                                   {"grip", in.gripClick}, {"menu", in.menuClick}}},
+                      {"pad", {{"touch", in.trackpadTouch}, {"click", in.trackpadClick}, {"x", in.trackpadX}, {"y", in.trackpadY}}},
                       {"fingers", {in.fingerIndex, in.fingerMiddle, in.fingerRing, in.fingerPinky}}};
       }
       printf("%s\n", j.dump().c_str());
@@ -500,7 +533,7 @@ int main(int argc, char** argv) {
       }
       lh::usb::ReportDecoder dec(&stats);
       r.ReadAll([&](const lh::usb::EndpointInfo& e) { dec.AddEndpoint(e); },
-                [&](const lh::usb::RawReport& rep) { dec.OnReport(rep); });
+                [&](const lh::usb::RawReport& rep) { stats.hostTime = rep.hostTime; dec.OnReport(rep); });
     }
     stats.Print();
     return 0;

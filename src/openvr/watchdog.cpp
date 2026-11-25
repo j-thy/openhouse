@@ -1,6 +1,6 @@
 // SteamVR's watchdog (IVRWatchdogProvider): loaded while SteamVR is not running, it starts
 // SteamVR when a device is turned on, as stock's CWatchdogDriver_Lighthouse does ("new
-// wireless connection", #38). Off when Steam's own setting is: "power" /
+// wireless connection"). Off when Steam's own setting is: "power" /
 // "autoLaunchSteamVROnButtonPress" ("Start SteamVR when a headset or controller is turned
 // on" in Steam's settings).
 //
@@ -8,7 +8,7 @@
 // - a receiver (dongle, 28de:2101/2102) that had no device gets one: a controller or tracker
 //   was turned on;
 // - a wired device (28de:2000/2012/2022/2300) is plugged in, unless SteamVR knows it as a
-//   controller or tracker (WiredPlugInWakes): those show up on a charging cable while off (#91).
+//   controller or tracker (WiredPlugInWakes): those show up on a charging cable while off.
 //   A Vive tracker and the Bigscreen Beyond are both 28de:2300, so it goes by the serial.
 // Devices already there when the watchdog starts don't wake it: SteamVR was just closed with
 // them, or Steam is starting.

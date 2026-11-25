@@ -55,7 +55,7 @@ std::string PairingMailbox::Discover(Session& session, const std::string& expect
   for (const auto& r : session.Receivers())
     j["dongles"].push_back({{"serial", r.serial}, {"firmwareVersion", ""}, {"connectedSerial", r.connected}});
   if (messageId) j["message_id"] = json::parse(*messageId);
-  return j.dump(-1, ' ', false, json::error_handler_t::replace);  // a receiver serial may not be UTF-8 (#45)
+  return j.dump(-1, ' ', false, json::error_handler_t::replace);  // a receiver serial may not be UTF-8
 }
 
 void PairingMailbox::Finish(Session& session, const std::string& result, const std::string& connected,
@@ -83,7 +83,7 @@ void PairingMailbox::Poll(Session& session, const std::string& expected) {
     if (r != 0 || needed == 0) break;
     const json message = json::parse(std::string(buffer_.data(), strnlen(buffer_.data(), buffer_.size())), nullptr, false);
     if (!message.is_object()) continue;
-    // Fields of another JSON type read as missing: value() throws on them (#45).
+    // Fields of another JSON type read as missing: value() throws on them.
     const auto text = [&](const char* key) {
       const auto it = message.find(key);
       return it != message.end() && it->is_string() ? it->get<std::string>() : std::string();

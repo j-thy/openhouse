@@ -1,3 +1,4 @@
+#include "common/ootx_frame.hpp"
 #include "common/test_paths.hpp"
 #include <set>
 // Tests for the lh runtime: room map, Index input, device roles, and an end-to-end
@@ -18,6 +19,7 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 
+#include "lh/input_sink.hpp"
 #include "lh/session.hpp"
 #include "runtime/device_role.hpp"
 #include "runtime/device_tracker.hpp"
@@ -26,12 +28,148 @@
 #include "runtime/model_scale.hpp"
 #include "runtime/room_map.hpp"
 #include "runtime/room_solver.hpp"
+#include "runtime/sob_channels.hpp"
 #include "tracking/lighthouse_model.hpp"
 #ifdef LH_TEST_USB
 #include "transport/usb/raw_capture.hpp"
 #endif
 
 namespace lh::runtime {
+namespace {
+SessionBase ChannelBase(uint32_t serial, int channel, bool seen = true, bool cached = false) {
+  SessionBase base;
+  base.config.serial = serial;
+  base.config.valid = true;
+  base.config.cal.resize(14);
+  base.dynamic.sobChannel = channel;
+  base.dynamic.cached = cached;
+  base.seen = seen;
+  return base;
+}
+}  // namespace
+
+TEST(SobChannels, DirectReportsOnOneChannelConflict) {
+  const auto resolved = ResolveSobChannels({{1, ChannelBase(1, 0)}, {2, ChannelBase(2, 0)}});
+  EXPECT_EQ(resolved.blocked, std::bitset<sob::kChannels>(1));
+  EXPECT_EQ(resolved.conflictedBases, (std::set<uint32_t>{1, 2}));
+  EXPECT_EQ(resolved.firstConflict[0], std::make_pair(1u, 2u));
+  EXPECT_TRUE(resolved.known.empty());
+}
+
+TEST(SobChannels, DirectReportWinsOverARecall) {
+  const auto resolved = ResolveSobChannels({{1, ChannelBase(1, 0, false)}, {2, ChannelBase(2, 0)}});
+  EXPECT_TRUE(resolved.blocked.none());
+  EXPECT_TRUE(resolved.conflictedBases.empty());
+  ASSERT_EQ(resolved.known.count(0), 1u);
+  EXPECT_EQ(resolved.known.at(0).first.serial, 2u);
+}
+
+TEST(SobChannels, TwoRecallsGiveNoChannelAssignmentOrConflict) {
+  const auto resolved = ResolveSobChannels({{1, ChannelBase(1, 0, false)}, {2, ChannelBase(2, 0, true, true)}});
+  EXPECT_TRUE(resolved.blocked.none());
+  EXPECT_TRUE(resolved.conflictedBases.empty());
+  EXPECT_TRUE(resolved.known.empty());
+}
+
+TEST(SobChannels, CachedReportCannotReplaceDirectReportForSameBase) {
+  auto base = ChannelBase(1, 0);
+  const auto cached = ChannelBase(1, 1, true, true);
+  EXPECT_FALSE(base.Accepts(cached.dynamic));
+  EXPECT_TRUE(base.Accepts(ChannelBase(1, 1).dynamic));
+  EXPECT_TRUE(cached.Accepts(ChannelBase(1, 1).dynamic));
+  if (base.Accepts(cached.dynamic)) base.dynamic = cached.dynamic;
+  const auto resolved = ResolveSobChannels({{1, base}});
+  EXPECT_EQ(resolved.known.count(0), 1u);
+  EXPECT_EQ(resolved.known.count(1), 0u);
+}
+
+TEST(SobChannels, DirectReportOnNewChannelClearsConflict) {
+  std::map<uint32_t, SessionBase> bases{{1, ChannelBase(1, 0)}, {2, ChannelBase(2, 0)}};
+  ASSERT_TRUE(ResolveSobChannels(bases).blocked[0]);
+  bases.at(2).dynamic.sobChannel = 1;
+  const auto resolved = ResolveSobChannels(bases);
+  EXPECT_TRUE(resolved.blocked.none());
+  EXPECT_TRUE(resolved.conflictedBases.empty());
+  ASSERT_EQ(resolved.known.size(), 2u);
+  EXPECT_EQ(resolved.known.at(0).first.serial, 1u);
+  EXPECT_EQ(resolved.known.at(1).first.serial, 2u);
+}
+
+namespace {
+constexpr char kTestTracker[] = "LHR-TEST-SOB";
+constexpr char kTestTrackerConfig[] = R"({
+  "device_class": "generic_tracker",
+  "lighthouse_config": {"modelPoints": [[0, 0, 0]], "modelNormals": [[0, 0, 1]]}
+})";
+
+double FeedSobOotx(IInputSink& input, uint32_t serial, int channel, double start, int generation = 0) {
+  std::vector<uint8_t> payload(43, 0);
+  payload[0] = 8;
+  for (int byte = 0; byte < 4; ++byte) payload[2 + byte] = uint8_t(serial >> (8 * byte));
+  payload[15] = 0x0b;
+  const double period = sob::kPeriodTicks[channel] * sob::kTickSeconds;
+  double time = start;
+  for (uint8_t bit : test::LhbsFrame(payload)) {
+    input.OnLh2BeamWord(kTestTracker, {time, channel, bit, generation});
+    time += period;
+  }
+  return time;
+}
+}  // namespace
+
+TEST(SessionSobChannels, ThirdStationKeepsTheOldChannelBlockedAfterOneMoves) {
+  auto session = Session::Create();
+  auto* input = dynamic_cast<IInputSink*>(session.get());
+  ASSERT_NE(input, nullptr);
+  input->OnDeviceAttached(kTestTracker, kTestTrackerConfig);
+
+  double time = FeedSobOotx(*input, 1, 0, 1);
+  input->OnImu(kTestTracker, {time});
+  time = FeedSobOotx(*input, 2, 0, time, 1);
+  input->OnImu(kTestTracker, {time});
+  const auto conflict = session->PollEvents();
+  ASSERT_TRUE(std::any_of(conflict.begin(), conflict.end(), [](const auto& event) {
+    return event.text.find("channel 1 conflict:") != std::string::npos;
+  }));
+
+  time = FeedSobOotx(*input, 3, 0, time);
+  input->OnImu(kTestTracker, {time});
+  const auto withThird = session->Snapshot();
+  EXPECT_TRUE(std::any_of(withThird.bases.begin(), withThird.bases.end(), [](const auto& base) {
+    return base.id == 3 && base.seen && base.channel == "1";
+  }));
+  time = FeedSobOotx(*input, 2, 1, time);
+  input->OnImu(kTestTracker, {time});
+  const auto afterFirstMove = session->PollEvents();
+  EXPECT_TRUE(std::none_of(afterFirstMove.begin(), afterFirstMove.end(), [](const auto& event) {
+    return event.text.find("channel 1 conflict cleared") != std::string::npos;
+  }));
+
+  time = FeedSobOotx(*input, 3, 2, time);
+  input->OnImu(kTestTracker, {time});
+  const auto afterSecondMove = session->PollEvents();
+  EXPECT_TRUE(std::any_of(afterSecondMove.begin(), afterSecondMove.end(), [](const auto& event) {
+    return event.text.find("channel 1 conflict cleared") != std::string::npos;
+  }));
+}
+
+TEST(SessionSobChannels, OpticalObservationTimePrecedesDelayedImu) {
+  auto session = Session::Create();
+  auto* input = dynamic_cast<IInputSink*>(session.get());
+  ASSERT_NE(input, nullptr);
+  input->OnDeviceAttached(kTestTracker, kTestTrackerConfig);
+
+  const double time = FeedSobOotx(*input, 7, 2, 1);
+  const double writeCompletedAt = session->HostNow();
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  input->OnImu(kTestTracker, {time});
+  const auto snap = session->Snapshot();
+  ASSERT_EQ(snap.bases.size(), 1u);
+  EXPECT_EQ(snap.bases.front().channel, "3");
+  EXPECT_GE(snap.bases.front().channelObservedAt, 0);
+  EXPECT_LE(snap.bases.front().channelObservedAt, writeCompletedAt);
+}
+
 struct DeviceTrackerTestAccess {
   static LighthouseDirect& Core(DeviceTracker& d) { return *d.filter_; }
   static direct::DirectFilter& Filter(DeviceTracker& d) { return d.filter_->FilterForTest(); }
@@ -474,6 +612,127 @@ TEST(RoomMap, LockedBaseMovesOnlyWhenBumped) {
   EXPECT_NEAR(room.Base(2)->worldFromBase.translation().x(), away.translation().x(), 1e-6);
 }
 
+// A base's gravity at the first start of a day differs a little from the one saved warm the session
+// before (standby, temperature): 1.3 deg re-learned a base at every first start. A real turn while
+// nothing ran still counts, and within a session the tight threshold still applies.
+TEST(RoomMap, SmallTurnAgainstSavedGravityIsNotABump) {
+  const auto path = (std::filesystem::temp_directory_path() / ("lh-test-coldstart-" + std::to_string(lh::platform::ProcessId()) + ".json")).string();
+  const auto tilted = [](double deg) {
+    BaseDynamicState d;
+    const double r = deg * 0.017453292519943295;
+    d.accelDir = {0.f, float(std::cos(r)), float(std::sin(r))};
+    d.sysUnlockCount = 7;
+    return d;
+  };
+  {
+    RoomMap r;
+    r.OnBaseSeen(Config(1), tilted(0));
+    ASSERT_TRUE(r.EstablishOrigin(1, {0.0, 0.0}, 1e-6));
+    r.OnBaseSeen(Config(2), tilted(0));
+    r.ApplySolved(2, Pose(3, 0.5, -2, 40), 1e-6, 1e-7, 150, 1e-4);
+    ASSERT_TRUE(RoomMap::Locked(*r.Base(2)));
+    ASSERT_TRUE(r.Save(path));
+  }
+  const auto bumped = [](RoomMap& r) {
+    for (const auto& line : r.TakeLogs()) if (line.find("knocked") != std::string::npos) return true;
+    return false;
+  };
+  {
+    RoomMap r;  // first start: 1.3 deg off the saved gravity
+    ASSERT_TRUE(r.Load(path));
+    r.OnBaseSeen(Config(1), tilted(0));
+    for (int i = 0; i < 3; ++i) r.OnBaseSeen(Config(2), tilted(1.3));
+    EXPECT_FALSE(bumped(r));
+    EXPECT_FALSE(RoomMap::Locked(*r.Base(2)));   // loosened (SmallTurnKeepsTheSavedLevel), not relearned
+    EXPECT_FALSE(r.Base(2)->relearn);
+    for (int i = 0; i < 2; ++i) r.OnBaseSeen(Config(2), tilted(3.0));   // then knocked in the session: 1.7 deg
+    EXPECT_TRUE(bumped(r));
+  }
+  {
+    RoomMap r;  // turned 5 deg while nothing ran
+    ASSERT_TRUE(r.Load(path));
+    r.OnBaseSeen(Config(1), tilted(0));
+    for (int i = 0; i < 2; ++i) r.OnBaseSeen(Config(2), tilted(5.0));
+    EXPECT_TRUE(bumped(r));
+  }
+  std::filesystem::remove(path);
+}
+
+// Moved a little while nothing ran: 1.4 deg reads like a cold base, so it isn't relearned, but it's
+// loosened so the room solver can follow it, and the saved level is kept rather than replaced by the new
+// reading (which would hide the move from the next session). Close to the saved level, nothing changes.
+TEST(RoomMap, SmallTurnKeepsTheSavedLevel) {
+  const auto path = (std::filesystem::temp_directory_path() / ("lh-test-keptlevel-" + std::to_string(lh::platform::ProcessId()) + ".json")).string();
+  const auto tilted = [](double deg) {
+    BaseDynamicState d;
+    const double r = deg * 0.017453292519943295;
+    d.accelDir = {0.f, float(std::cos(r)), float(std::sin(r))};
+    d.sysUnlockCount = 7;
+    return d;
+  };
+  const auto savedTilt = [&] {
+    RoomMap r;
+    EXPECT_TRUE(r.Load(path));
+    const auto& g = r.KnownConfigs().at(2u).second.accelDir;
+    return std::atan2(double(g[2]), double(g[1])) * 57.29577951308232;
+  };
+  {
+    RoomMap r;
+    r.OnBaseSeen(Config(1), tilted(0));
+    ASSERT_TRUE(r.EstablishOrigin(1, {0.0, 0.0}, 1e-6));
+    r.OnBaseSeen(Config(2), tilted(0));
+    r.ApplySolved(2, Pose(3, 0.5, -2, 40), 1e-6, 1e-7, 150, 1e-4);
+    ASSERT_TRUE(RoomMap::Locked(*r.Base(2)));
+    ASSERT_TRUE(r.Save(path));
+  }
+  {
+    RoomMap r;  // 1.4 deg off: loosened, its saved level kept
+    ASSERT_TRUE(r.Load(path));
+    r.OnBaseSeen(Config(1), tilted(0));
+    for (int i = 0; i < 3; ++i) r.OnBaseSeen(Config(2), tilted(1.4));
+    bool logged = false, knocked = false;
+    for (const auto& line : r.TakeLogs()) {
+      logged |= line.find("off the saved one") != std::string::npos;
+      knocked |= line.find("knocked") != std::string::npos;
+    }
+    EXPECT_TRUE(logged);
+    EXPECT_FALSE(knocked);
+    EXPECT_FALSE(RoomMap::Locked(*r.Base(2)));
+    ASSERT_TRUE(r.Save(path));
+  }
+  EXPECT_NEAR(savedTilt(), 0.0, 0.01);
+  {
+    RoomMap r;  // next session, still 1.4 deg off the level its pose was learned at: noticed again
+    ASSERT_TRUE(r.Load(path));
+    r.OnBaseSeen(Config(1), tilted(0));
+    for (int i = 0; i < 3; ++i) r.OnBaseSeen(Config(2), tilted(1.4));
+    bool logged = false;
+    for (const auto& line : r.TakeLogs()) logged |= line.find("off the saved one") != std::string::npos;
+    EXPECT_TRUE(logged);
+  }
+  {
+    RoomMap r;  // re-placed after a bump: its level now goes with its new pose
+    ASSERT_TRUE(r.Load(path));
+    r.OnBaseSeen(Config(1), tilted(0));
+    for (int i = 0; i < 2; ++i) r.OnBaseSeen(Config(2), tilted(5.0));
+    r.ApplySolved(2, Pose(3.03, 0.5, -2, 41), 1e-6, 1e-7, 150, 1e-4, 2);
+    ASSERT_FALSE(r.Base(2)->relearn);
+    ASSERT_TRUE(r.Save(path));
+  }
+  EXPECT_NEAR(savedTilt(), 5.0, 0.05);
+  {
+    RoomMap r;  // close to the saved level: still locked, and this reading is saved
+    ASSERT_TRUE(r.Load(path));
+    r.OnBaseSeen(Config(1), tilted(0));
+    r.ApplySolved(2, Pose(3.03, 0.5, -2, 41), 1e-6, 1e-7, 150, 1e-4, 2);
+    for (int i = 0; i < 3; ++i) r.OnBaseSeen(Config(2), tilted(5.4));
+    for (const auto& line : r.TakeLogs()) EXPECT_EQ(line.find("off the saved one"), std::string::npos) << line;
+    ASSERT_TRUE(r.Save(path));
+  }
+  EXPECT_NEAR(savedTilt(), 5.4, 0.05);
+  std::filesystem::remove(path);
+}
+
 TEST(RoomMap, TurnedOriginStartsANewRoom) {
   const auto path = (std::filesystem::temp_directory_path() / ("lh-test-stale-" + std::to_string(lh::platform::ProcessId()) + ".json")).string();
   const Eigen::Vector3d upright(0.024, -1.0, -0.008), mounted(0.128, -0.738, 0.663);
@@ -811,6 +1070,40 @@ TEST(SessionReplay, BootstrapsDespiteOneBadSensor) {
   }
 #endif
 }
+
+#ifdef LH_TEST_USB
+TEST(SessionReplay, TundraPowerButton) {
+  const auto dir = std::filesystem::temp_directory_path() /
+                   ("lh-tundra-button-" + std::to_string(lh::platform::ProcessId()));
+  std::filesystem::create_directories(dir);
+  usb::EndpointInfo ep;
+  ep.kind = usb::EndpointKind::Wireless;
+  ep.serial = "LHR-TUNDRA";
+  ep.configJson = R"({"device_class":"generic_tracker","manufacturer":"Tundra Labs","model_number":"Tundra Tracker",
+                      "lighthouse_config":{"modelPoints":[[0,0,0]],"modelNormals":[[0,1,0]]}})";
+
+  for (bool release : {false, true}) {
+    usb::RawCaptureWriter writer;
+    ASSERT_TRUE(writer.Open((dir / "input.lhraw").string()));
+    writer.WriteEndpoint(ep);
+    // One Watchman slot carrying the system button, optionally followed by a release.
+    uint8_t report[30] = {0x23, 0, 3, 0, 0xf1, 0x08};
+    writer.WriteReport(1.0, ep.ep, true, report, sizeof(report));
+    if (release) {
+      report[5] = 0;
+      writer.WriteReport(1.1, ep.ep, true, report, sizeof(report));
+    }
+    writer.Close();
+    const auto result = Replay((dir / "room.json").string(), dir.string());
+    ASSERT_EQ(result.last.devices.size(), 1u);
+    const auto& device = result.last.devices.front();
+    EXPECT_EQ(device.info.role, DeviceRole::Tracker);
+    ASSERT_TRUE(device.input.has_value());
+    EXPECT_EQ(device.input->systemClick, !release);
+  }
+  std::filesystem::remove_all(dir);
+}
+#endif
 
 TEST(SessionReplay, ControllerPowerCycleStartsFreshTrackingEpoch) {
 #ifndef LH_TEST_USB
@@ -1237,7 +1530,7 @@ TEST(MixedLight, TheCommandLineWins) {
   EXPECT_TRUE(MixedFromSettings(R"({"mixedLight": false})", true).enabled);
 }
 
-// #86: a room learned before device model scales were applied (no "modelScale") keeps its
+// A room learned before device model scales were applied (no "modelScale") keeps its
 // bases, unlocked and less certain, once: the solver refines them in the same room.
 TEST(RoomMap, RoomLearnedWithoutModelScalesIsRefinedOnce) {
   const auto path = (std::filesystem::temp_directory_path() / ("lh-test-scale-" + std::to_string(lh::platform::ProcessId()) + ".json")).string();

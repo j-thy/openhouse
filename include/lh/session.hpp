@@ -78,7 +78,7 @@ struct DevicePose {
   double filterTime = 0;
 };
 
-// Controller input: Index ("Knuckles") controllers and Vive wands. Trackers report none.
+// Decoded controller and tracker inputs. A tracker power button reports systemClick.
 struct ControllerInput {
   double hostTime = 0;
   // Buttons (pressed).
@@ -106,6 +106,8 @@ struct ControllerInput {
 enum class ControllerType { Index, ViveWand, Mapped };
 
 struct DeviceInfo {
+  bool IsTundraTracker() const { return manufacturer == "Tundra Labs" && model == "Tundra Tracker"; }
+
   std::string serial;           // "LHR-13DA81D1", or "LHB-A101B835" for bases
   DeviceRole role = DeviceRole::Tracker;
   std::string deviceClass;      // raw config device_class
@@ -130,6 +132,7 @@ struct BaseStationState {
   double positionVariance = 0, rotationVariance = 0;
   int mode = 0;                 // 1 A, 2 B, 3 C
   bool lh2 = false;             // a 2.0 base station (its light is LH2 words)
+  double channelObservedAt = -1;  // host time of the last directly decoded LH2 OOTX
   std::string channel;          // as its display shows it: "A" "b" "c", lhbs multi "1".."4"; "" unknown
   int faults = 0;
   bool origin = false;
@@ -282,8 +285,26 @@ class Session {
 
   // Wireless receivers (dongles), live USB only: serial, and the device paired and
   // connected to it now ("" if none).
-  struct Receiver { std::string serial, connected; };
+  // Link stats are live estimates over the last second; -1 / 0 where the receiver can't tell.
+  // A Doorman Dongle appears once per paired slot ("OHDG-<id>/<slot>"), like a dongle each.
+  struct Receiver {
+    std::string serial, connected;
+    std::string kind;            // "watchman" (Valve/HTC dongle) or "openhouse" (one slot of ours)
+    int slot = -1;               // openhouse slot, -1 for a Watchman dongle
+    bool paired = true;          // openhouse: a device is paired to the slot (empty slots are listed too)
+    bool linked = false;         // a device is talking through it now
+    double kBytesPerSec = 0;     // payload from the device
+    double framesPerSec = 0;     // reports (Watchman) or radio frames (openhouse)
+    double lossPercent = -1;     // radio polls without a good answer (openhouse)
+    double dropsPerSec = 0;      // frames lost on the dongle (openhouse)
+    int rssiDongle = 0, rssiDevice = 0;   // dBm (openhouse), 0 unknown
+    int devicesOnDongle = 0;     // openhouse: devices joined on the whole dongle
+    std::string name;            // openhouse: the user's name for the slot's device, kept on the dongle
+    bool keepsName = false;      // openhouse: the dongle keeps names (firmware 0x0025+)
+  };
   virtual std::vector<Receiver> Receivers() const = 0;
+  // Stores a name on an openhouse slot ("OHDG-.../3"); false if there's no such slot.
+  virtual bool SetReceiverName(const std::string& receiver, const std::string& name) = 0;
   // Pairing mode on a receiver for `seconds` (0 leaves it); false if not plugged in.
   virtual bool SetPairing(const std::string& receiver, double seconds) = 0;
   // Live USB: the radio of the receiver with Bluetooth, for SteamVR's base station power

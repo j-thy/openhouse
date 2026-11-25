@@ -45,6 +45,7 @@ struct Keyframe {
   double speed = 0, rate = 0;           // m/s, rad/s of the device when taken
   Eigen::Isometry3d primaryFromDevice = Eigen::Isometry3d::Identity();
   std::map<uint32_t, std::vector<KeySample>> samples;  // per base
+  bool settled = true;  // calibrated, and tracking for kVoteSettle s: may vote a base moved (deviceSupport)
 };
 
 struct SolvedBase {

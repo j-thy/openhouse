@@ -505,7 +505,7 @@ RoomSolveOutput SolveRoom(const RoomSolveInput& in) {
     knownBlock.Set(known);
     const double* solvedV = bases.at(base).v;
     for (size_t i = 0; i < kfs.size(); ++i) {
-      if (!use[i]) continue;
+      if (!use[i] || !kfs[i].k->settled) continue;
       const auto s = kfs[i].k->samples.find(base);
       if (s == kfs[i].k->samples.end()) continue;
       auto& a = acc[kfs[i].k->device];
@@ -617,7 +617,7 @@ bool KeyframeStore::Add(std::shared_ptr<const Keyframe> keyframe, const std::opt
 
 void KeyframeStore::DropBase(uint32_t base) {
   entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
-                                [&](const Entry& e) { return e.keyframe->samples.count(base) != 0; }),
+                                [&](const Entry& e) { return e.keyframe->primary == base || e.keyframe->samples.contains(base); }),
                  entries_.end());
 }
 

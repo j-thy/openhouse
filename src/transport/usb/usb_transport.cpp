@@ -24,12 +24,15 @@ namespace lh::usb {
 
 // A message for the sink (the session: its event log, the driver's log, the viewer).
 void UsbTransport::Log(LogLevel level, const char* format, ...) {
-  char text[512];
-  va_list args;
+  // Any length: an eight-slot link line runs past 512 characters (slot 7 was cut off).
+  va_list args, again;
   va_start(args, format);
-  std::vsnprintf(text, sizeof text, format, args);
+  va_copy(again, args);
+  const int n = std::vsnprintf(nullptr, 0, format, args);
   va_end(args);
-  std::string line = text;
+  std::string line(size_t(std::max(n, 0)), '\0');
+  if (n > 0) std::vsnprintf(line.data(), line.size() + 1, format, again);
+  va_end(again);
   while (!line.empty() && line.back() == '\n') line.pop_back();
   sink_->OnTransportLog(level, line);
 }
@@ -37,7 +40,7 @@ namespace {
 
 // No wireless data for this long: a new radio epoch (the receiver may have missed the off notification).
 constexpr double kRadioGap = 1.0;  // s
-// #92: how long a receiver that doesn't say which device it has is asked again, and how often.
+// How long a receiver that doesn't say which device it has is asked again, and how often.
 constexpr double kDeviceCheck = 3.0, kDeviceRecheck = 0.25;  // s
 
 constexpr uint16_t kValveVid = 0x28de;
@@ -102,7 +105,7 @@ void ReportDecoder::AddEndpoint(const EndpointInfo& e) {
   eps_[e.ep] = std::move(ep);
   // The buttons interface carries no config: its device attaches with its IMU interface.
   // Announced when it's new, carries a config, or is the device's only endpoint again after
-  // an unplug (a replugged device without a readable config was otherwise never re-attached, #49.3).
+  // an unplug (a replugged device without a readable config was otherwise never re-attached).
   const bool alone = std::none_of(eps_.begin(), eps_.end(), [&](const auto& other) {
     return other.first != e.ep && other.second.info.serial == e.serial;
   });
@@ -161,7 +164,7 @@ UsbTransport::~UsbTransport() { Stop(); }
 std::string UsbTransport::LoadSteamConfig(const std::string& dir, const std::string& serial) {
   std::string lower = serial;
   std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
-  std::ifstream f(dir + "/" + lower + "/config.json");
+  std::ifstream f(platform::FsPath(dir + "/" + lower + "/config.json"));
   if (!f) return {};
   std::stringstream ss;
   ss << f.rdbuf();
@@ -187,7 +190,7 @@ std::optional<uint32_t> UsbTransport::ConnectedSerial(hid_device_* receiver) {
   return di.serial;
 }
 
-// #92: whether the device on a receiver is no longer the one it was set up for. A dongle can be
+// Whether the device on a receiver is no longer the one it was set up for. A dongle can be
 // paired with several devices and serves whichever is on (one at a time), staying plugged in; it was
 // identified only when opened, so a 3.0 tracker switched on in place of a 2018 one was taken for it,
 // with the 2018's sensor layout. Asked only after a disconnect or a radio gap (Run asks again while
@@ -196,7 +199,7 @@ std::optional<uint32_t> UsbTransport::ConnectedSerial(hid_device_* receiver) {
 int UsbTransport::OtherDeviceConnected(const std::string& path, const std::string& serial, const std::string& receiver) {
   hid_device* h = nullptr;
   {
-    static std::mutex openMutex;  // hid_open_path's error string is process-wide (#49.5)
+    static std::mutex openMutex;  // hid_open_path's error string is process-wide
     std::lock_guard openLock(openMutex);
     h = hid_open_path(path.c_str());
   }
@@ -266,7 +269,7 @@ bool UsbTransport::RequestProtocolVersion(hid_device_* dev, int version) {
 
 UsbTransport::OpenResult UsbTransport::OpenEndpoint(const hid_device_info* d, Open* out) {
   // One open at a time: hidapi's hid_open_path resets and sets a process-wide error string,
-  // which parallel opens would free twice (#49.5). The config read after it stays parallel.
+  // which parallel opens would free twice. The config read after it stays parallel.
   static std::mutex openMutex;
   hid_device* h = nullptr;
   {
@@ -322,6 +325,8 @@ UsbTransport::OpenResult UsbTransport::OpenEndpoint(const hid_device_info* d, Op
 }
 
 void UsbTransport::Enumerate(bool startup) {
+  static const bool ohOnly = getenv("LH_DOORMAN_ONLY") != nullptr;  // only the Doorman Dongle (testing)
+  if (ohOnly) return;
   hid_device_info* list = hid_enumerate(kValveVid, 0);
   std::set<std::string> present;
   std::vector<hid_device_info*> fresh;
@@ -342,7 +347,7 @@ void UsbTransport::Enumerate(bool startup) {
       workers.emplace_back([&, i] { results[i] = OpenEndpoint(fresh[i], &opened[i]); });
     for (auto& w : workers) w.join();
   }
-  // Every opened handle goes to a list Stop() closes, stopping or not (#49.4).
+  // Every opened handle goes to a list Stop() closes, stopping or not.
   for (size_t i = 0; i < fresh.size(); ++i) {
     Open& o = opened[i];
     const OpenResult result = results[i];
@@ -357,6 +362,7 @@ void UsbTransport::Enumerate(bool startup) {
       capture_.WriteEndpoint(o.info);
       decoder_.AddEndpoint(o.info);
       if (o.wantVersion) RequestVersion(o);
+      if (o.info.kind == EndpointKind::Imu && o.receiver.empty()) doormanCarriers_.AddWired(o.info.serial);
       open_.push_back(o);
     } else {
       std::lock_guard lock(pendingMutex_);
@@ -501,20 +507,110 @@ void UsbTransport::DropReceiver(const std::string& serial) {
 }
 
 std::vector<UsbTransport::Receiver> UsbTransport::Receivers() const {
-  std::lock_guard lock(receiversMutex_);
   std::vector<Receiver> out;
-  for (const auto& [serial, r] : receivers_) out.push_back(r);
+  {
+    std::lock_guard lock(receiversMutex_);
+    for (const auto& [serial, r] : receivers_) out.push_back(r);
+  }
+  // Each slot of a Doorman Dongle shows as a receiver of its own, empty ones too, so SteamVR's
+  // pairing page sees what's free: empty slots first (pairing takes the first one offered free),
+  // then paired ones, whose device may be off (pairing into one of those replaces it). With
+  // several dongles, every dongle's empty slots come before any paired one, each by dongle serial.
+  std::vector<Receiver> slots;
+  for (const auto& dongle : DoormanDongles()) {
+    for (const auto& st : dongle->SlotStats()) {   // none while the dongle isn't open
+      Receiver r;
+      r.serial = dongle->Serial() + "/" + std::to_string(st.slot);
+      r.connected = st.serial; r.pid = 0x0001; r.kind = "openhouse"; r.slot = st.slot;
+      r.linked = st.active; r.kBytesPerSec = st.kBytesPerSec; r.framesPerSec = st.framesPerSec;
+      r.lossPercent = st.lossPercent; r.dropsPerSec = st.dropsPerSec;
+      r.rssiDongle = st.rssiDongle; r.rssiDevice = st.rssiDevice; r.devicesOnDongle = st.devicesOnDongle;
+      r.paired = st.used;
+      r.name = st.name; r.keepsName = st.haveName;
+      slots.push_back(r);
+    }
+  }
+  std::stable_sort(slots.begin(), slots.end(), [](const auto& a, const auto& b) { return !a.paired && b.paired; });
+  out.insert(out.end(), slots.begin(), slots.end());
   return out;
 }
 
 void UsbTransport::OnDeviceGone(const DeviceId& serial) {
-  std::lock_guard lock(receiversMutex_);
-  for (auto& [id, r] : receivers_) {
-    if (r.connected == serial) r.connected.clear();
+  {
+    std::lock_guard lock(receiversMutex_);
+    for (auto& [id, r] : receivers_) {
+      if (r.connected == serial) r.connected.clear();
+    }
   }
+  for (const auto& dongle : DoormanDongles()) dongle->DeviceGone(serial);
+}
+
+std::vector<std::shared_ptr<DoormanDongle>> UsbTransport::DoormanDongles() const {
+  std::lock_guard lock(doormanMutex_);
+  return doorman_;
+}
+
+void UsbTransport::ScanDoorman() {
+  std::map<std::string, int> shared;
+  auto found = ScanDoormanDongles(&shared);
+  for (const auto& [serial, count] : shared)
+    if (doormanShared_.insert(serial).second)
+      Log(LogLevel::Warn, "%d Doorman Dongles share the name %s (the same USB serial): their interfaces can't be told "
+                          "apart, so none of them is used\n", count, serial.c_str());
+  std::erase_if(doormanShared_, [&](const std::string& serial) { return !shared.count(serial); });
+  std::lock_guard lock(doormanMutex_);
+  doormanFound_ = std::move(found);
+}
+
+void UsbTransport::PumpDoorman(double now) {
+  std::optional<std::vector<DoormanDongleFound>> found;
+  std::vector<std::shared_ptr<DoormanDongle>> dongles;
+  {
+    std::lock_guard lock(doormanMutex_);
+    found.swap(doormanFound_);
+    dongles = doorman_;
+  }
+  if (found) {
+    for (const auto& f : *found) {
+      auto it = std::find_if(dongles.begin(), dongles.end(), [&](const auto& d) { return d->Serial() == f.serial; });
+      if (it == dongles.end()) {
+        auto dongle = std::make_shared<DoormanDongle>(
+            f.serial, sink_, &decoder_, &capture_, &nextEp_, opts_.steamLighthouseConfigDir,
+            [this](LogLevel level, const std::string& text) { Log(level, "%s\n", text.c_str()); }, &doormanCarriers_);
+        const auto bySerial = [](const auto& a, const auto& b) { return a->Serial() < b->Serial(); };
+        dongles.insert(std::upper_bound(dongles.begin(), dongles.end(), dongle, bySerial), dongle);
+        std::lock_guard lock(doormanMutex_);
+        doorman_ = dongles;
+        it = std::find(dongles.begin(), dongles.end(), dongle);
+      }
+      DoormanDongle& dongle = **it;
+      if (!dongle.IsOpen()) dongle.Open(f, now);
+    }
+  }
+  // No lock held: a device detaching here calls back into OnDeviceGone through the sink.
+  for (const auto& dongle : dongles) dongle->Pump(now);
+}
+
+bool UsbTransport::SetReceiverName(const std::string& receiver, const std::string& name) {
+  for (const auto& dongle : DoormanDongles()) {
+    const std::string& serial = dongle->Serial();
+    if (receiver.size() != serial.size() + 2 || receiver.compare(0, serial.size(), serial) != 0 || receiver[serial.size()] != '/') continue;
+    const char c = receiver.back();
+    if (c < '0' || c >= '0' + DoormanDongle::kSlots) continue;
+    return dongle->SetName(c - '0', name);
+  }
+  return false;
 }
 
 bool UsbTransport::SetPairing(const std::string& receiver, int milliseconds) {
+  for (const auto& dongle : DoormanDongles()) {   // the dongle ("OHDG-...") or one of its slots ("OHDG-.../3")
+    const std::string& serial = dongle->Serial();
+    if (receiver.compare(0, serial.size(), serial) != 0) continue;
+    const std::string rest = receiver.substr(serial.size());
+    const bool slotted = rest.size() == 2 && rest[0] == '/' && rest[1] >= '0' && rest[1] < '0' + DoormanDongle::kSlots;
+    if (!rest.empty() && !slotted) continue;   // another dongle whose serial starts with this one's
+    return dongle->Pair(milliseconds, slotted ? rest[1] - '0' : -1);
+  }
   {
     std::lock_guard lock(receiversMutex_);
     if (!receivers_.count(receiver)) return false;
@@ -656,6 +752,7 @@ void UsbTransport::ProbeMain() {
     RunDeviceChecks();
   };
   while (!stop_) {
+    ScanDoorman();   // Doorman Dongles: listed here, opened by the reader thread (also with LH_DOORMAN_ONLY)
     Enumerate(false);
     for (size_t i = 0; i < idle_.size() && !stop_;) {
       serve();
@@ -702,12 +799,24 @@ void UsbTransport::Stop() {
     failedPaths_.clear();
   }
   for (const auto& id : detached) sink_->OnDeviceDetached(id);
+  {
+    std::vector<std::shared_ptr<DoormanDongle>> dongles;
+    {
+      std::lock_guard lock(doormanMutex_);
+      dongles.swap(doorman_);
+      doormanFound_.reset();
+    }
+    doormanShared_.clear();   // the probe thread has ended
+    for (const auto& dongle : dongles) dongle->Close();   // no lock held: detaching calls OnDeviceGone
+  }
   capture_.Close();
 }
 
 std::vector<EndpointInfo> UsbTransport::Endpoints() const {
   std::vector<EndpointInfo> v;
   for (auto& o : open_) v.push_back(o.info);
+  for (const auto& dongle : DoormanDongles())
+    for (auto& e : dongle->Endpoints()) v.push_back(e);
   return v;
 }
 
@@ -716,7 +825,7 @@ void UsbTransport::Haptic(const DeviceId& serial, double frequency, double ampli
   // Coalesce by device: a newer command replaces a pending one.
   for (auto it = haptics_.begin(); it != haptics_.end();) {
     if (it->serial == serial && it->powerOff) return;
-    // Only pending pulses: a queued light-mode command must still go out (#49.2).
+    // Only pending pulses: a queued light-mode command must still go out.
     if (it->serial == serial && it->opticalMode < 0) it = haptics_.erase(it); else ++it;
   }
   if (haptics_.size() < 64) haptics_.push_back({serial, HapticReport(frequency, amplitude, duration), HostNow() + 0.1});
@@ -751,6 +860,7 @@ void UsbTransport::Run() {
         capture_.WriteEndpoint(o.info);
         decoder_.AddEndpoint(o.info);
         if (o.wantVersion) RequestVersion(o);
+        if (o.info.kind == EndpointKind::Imu && o.receiver.empty()) doormanCarriers_.AddWired(o.info.serial);
         open_.push_back(o);
       }
     }
@@ -765,7 +875,14 @@ void UsbTransport::Run() {
         capture_.Close();
         if (!path->empty()) {
           if (!capture_.Open(*path)) Log(LogLevel::Error, "cannot open capture %s\n", path->c_str());
-          else for (const auto& o : open_) capture_.WriteEndpoint(o.info);
+          else {
+            for (const auto& o : open_) capture_.WriteEndpoint(o.info);
+            // Doorman Dongle devices too: they wrote theirs when they attached, before this
+            // file existed, and without them every report of theirs in it was unreadable (a
+            // recording started mid-session had no Doorman devices at all).
+            for (const auto& dongle : DoormanDongles())
+              for (const auto& e : dongle->Endpoints()) capture_.WriteEndpoint(e);
+          }
         }
       }
     }
@@ -773,20 +890,51 @@ void UsbTransport::Run() {
     { std::lock_guard lock(hapticMutex_); commands.swap(haptics_); }
     for (const auto& command : commands) {
       DeviceCommandResult result{command.serial, command.powerOff, "not-connected", 0, command.report, command.opticalMode};
+      Open* target = nullptr;
+      Open* confirmedReceiver = nullptr;
+      int wirelessMatches = 0;
       if (passStart > command.deadline) result.status = "expired";
       else for (auto& o : open_) {
         if (o.disconnected || o.info.serial != command.serial) continue;
-        if (o.info.kind != EndpointKind::Wireless) {
-          if (command.opticalMode < 0 || o.info.kind != EndpointKind::Imu) continue;
-          const auto mode = WiredModeReport(command.opticalMode), verbosity = WiredVerbosityReport();
-          result.bytes = hid_send_feature_report(o.dev, mode.data(), mode.size());
-          if (result.bytes == int(mode.size())) hid_send_feature_report(o.dev, verbosity.data(), verbosity.size());
-          result.status = result.bytes == int(mode.size()) ? "written" : "write-failed";
+        // A cable carries mode and verbosity directly even if the device is still paired.
+        if (command.opticalMode >= 0 && o.info.kind == EndpointKind::Imu) {
+          target = &o;
           break;
         }
-        result.bytes = hid_send_feature_report(o.dev, command.report.data(), command.report.size());
-        result.status = result.bytes == int(command.report.size()) ? "written" : "write-failed";
-        break;
+        if (o.info.kind != EndpointKind::Wireless) continue;
+        // A previous receiver can still be open after the device pairs to another.
+        ++wirelessMatches;
+        if (o.radioIdentityConfirmed && (!confirmedReceiver || o.lastData > confirmedReceiver->lastData))
+          confirmedReceiver = &o;
+        target = wirelessMatches == 1 ? &o : confirmedReceiver;
+      }
+      if (target) {
+        if (target->info.kind == EndpointKind::Imu) {
+          const auto mode = WiredModeReport(command.opticalMode), verbosity = WiredVerbosityReport();
+          result.bytes = hid_send_feature_report(target->dev, mode.data(), mode.size());
+          if (result.bytes == int(mode.size())) hid_send_feature_report(target->dev, verbosity.data(), verbosity.size());
+          result.status = result.bytes == int(mode.size()) ? "written" : "write-failed";
+        } else {
+          result.bytes = hid_send_feature_report(target->dev, command.report.data(), command.report.size());
+          result.status = result.bytes == int(command.report.size()) ? "written" : "write-failed";
+        }
+      }
+      // The Doorman Dongle carrying the device, if any (a device is set up on one dongle only).
+      if (std::string(result.status) == "not-connected" && passStart <= command.deadline) {
+        for (const auto& oh : DoormanDongles()) {
+          if (command.opticalMode >= 0) {
+            // Our radio link carries the main MCU's wired host protocol: switch as on a cable.
+            const auto mode = WiredModeReport(command.opticalMode), verbosity = WiredVerbosityReport();
+            if (oh->Command(command.serial, mode, &result.status, 2)) {
+              oh->Command(command.serial, verbosity, &result.status, 2);
+              result.bytes = 2;
+              break;
+            }
+          } else if (oh->Command(command.serial, command.report, &result.status)) {
+            result.bytes = int(command.report.size());
+            break;
+          }
+        }
       }
       if (opts_.onCommandResult) opts_.onCommandResult(result);
       else if (std::string(result.status) != "written")
@@ -797,7 +945,7 @@ void UsbTransport::Run() {
       // is reopened (as one with no device) and the new one picked up when it connects.
       if (!o.disconnected && TakePairing(o)) {
         // Pairing takes the receiver from its device: report it gone now, as the endpoint
-        // is closed below in this pass and nothing would say so later (#49.1).
+        // is closed below in this pass and nothing would say so later.
         o.disconnected = true;
         sink_->OnDeviceDetached(o.info.serial);
       }
@@ -819,11 +967,28 @@ void UsbTransport::Run() {
           if (reps[count].n < 0) o.disconnected = true;
           break;
         }
+        o.rxBytes += uint64_t(reps[count].n); o.rxReports++;
+      }
+      if (passStart - o.rateT >= 1.0) {          // receiver link stats (Receivers())
+        const double dt = o.rateT > 0 ? passStart - o.rateT : 0;
+        if (dt > 0) {
+          o.kBytesPerSec = double(o.rxBytes - o.rateBytes) / dt / 1000;
+          o.reportsPerSec = double(o.rxReports - o.rateReports) / dt;
+        }
+        o.rateT = passStart; o.rateBytes = o.rxBytes; o.rateReports = o.rxReports;
+        if (!o.receiver.empty() && o.info.kind == EndpointKind::Wireless) {
+          std::lock_guard lock(receiversMutex_);
+          auto it = receivers_.find(o.receiver);
+          if (it != receivers_.end()) {
+            it->second.kBytesPerSec = o.kBytesPerSec; it->second.framesPerSec = o.reportsPerSec;
+            it->second.linked = !it->second.connected.empty() && o.reportsPerSec > 50;
+          }
+        }
       }
       for (int i = 0; i < count; i++) {
         const bool last = i == count - 1;
         if (o.info.kind == EndpointKind::Wireless) {
-          // #92: after a disconnect or a radio gap, the first data may be another device paired to this
+          // After a disconnect or a radio gap, the first data may be another device paired to this
           // receiver. Then it's reopened as one that has no device, as after pairing, and the new device
           // set up when the probe picks it up; its data isn't decoded as the old one's meanwhile.
           const uint8_t id = reps[i].buf[0];
@@ -832,6 +997,7 @@ void UsbTransport::Run() {
           // check without that missed a switch live. The probe thread asks (RunDeviceChecks); this
           // thread only queues the check and reads its answer, so it never waits on the receiver.
           if (id == 0x26 || (data && o.lastData > 0 && reps[i].t - o.lastData > kRadioGap)) {
+            o.radioIdentityConfirmed = false;
             o.checkDevice = true;
             o.checkUntil = reps[i].t + kDeviceCheck;
             o.nextCheck = 0;
@@ -856,6 +1022,13 @@ void UsbTransport::Run() {
                 o.disconnected = true;
                 break;
               }
+              if (*other == 0) o.radioIdentityConfirmed = true;
+              // The check's device-info request leaves the device sending no light until its
+              // protocol version is requested again, as it is after the same request when a
+              // device is first set up. Without this an Index controller switched off and on
+              // was located for half a second, then had no optical samples for the rest of the
+              // session, its buttons still working.
+              if (o.wantVersion) RequestVersion(o);
             }
           }
           if (data && o.checkDevice && !o.checkPending && reps[i].t >= o.nextCheck) {
@@ -880,6 +1053,7 @@ void UsbTransport::Run() {
       }
       if (o.disconnected) sink_->OnDeviceDetached(o.info.serial);
     }
+    PumpDoorman(HostNow());
     // Unplugged: close it and forget its path, so the probe thread reopens it when it
     // comes back (as a new endpoint; the device keeps its id).
     for (auto it = open_.begin(); it != open_.end();) {
@@ -888,6 +1062,7 @@ void UsbTransport::Run() {
       if (!it->receiver.empty()) DropReceiver(it->receiver);
       hid_close(it->dev);
       decoder_.RemoveEndpoint(it->info.ep);
+      if (it->info.kind == EndpointKind::Imu && it->receiver.empty()) doormanCarriers_.RemoveWired(it->info.serial);
       {
         std::lock_guard lock(pathsMutex_);
         paths_.erase(it->path);

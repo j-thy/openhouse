@@ -23,6 +23,7 @@
 #include "radio_mode.hpp"
 #include "raw_capture.hpp"
 #include "report_parser.hpp"
+#include "doorman_dongle.hpp"
 
 struct hid_device_;
 struct hid_device_info;
@@ -107,8 +108,16 @@ class UsbTransport {
 
   // Wireless receivers (dongles) plugged in now, and the device connected to each
   // ("" if none). Any thread.
-  struct Receiver { std::string serial, connected; uint16_t pid = 0; };
+  struct Receiver {
+    std::string serial, connected; uint16_t pid = 0;
+    std::string kind = "watchman"; int slot = -1; bool paired = true, linked = false;
+    double kBytesPerSec = 0, framesPerSec = 0, lossPercent = -1, dropsPerSec = 0;
+    int rssiDongle = 0, rssiDevice = 0, devicesOnDongle = 0;
+    std::string name; bool keepsName = false;   // openhouse: the name on the dongle, and whether it keeps one
+  };
   std::vector<Receiver> Receivers() const;
+  // The name a Doorman Dongle keeps for one of its slots ("OHDG-.../3"); false if there's no such slot.
+  bool SetReceiverName(const std::string& receiver, const std::string& name);
   // The device a receiver was carrying has gone (wireless dropout, powered off). Until this
   // existed, `receivers_[dongle].connected` kept the old serial: SteamVR kept showing the
   // dongle as occupied, its pairing page insisted a controller was still connected, and the
@@ -138,6 +147,7 @@ class UsbTransport {
   static std::string LoadSteamConfig(const std::string& dir, const std::string& serial);
 
  private:
+  friend struct UsbTransportTestAccess;  // tests/unit/test_doorman_dongles.cpp
   struct Open {
     EndpointInfo info;
     hid_device_* dev = nullptr;
@@ -150,13 +160,19 @@ class UsbTransport {
     std::string path;      // hidapi path, unique while plugged in
     bool bluetooth = false;  // receiver's radio in Bluetooth mode: no device can connect
     int keepalive = -1;      // last keepalive to a receiver with no device: 1 sent, 0 failed, -1 none yet
-    // A receiver can stay plugged in while another device paired to it connects (#92): its first
+    // A receiver can stay plugged in while another device paired to it connects: its first
     // data after a disconnect or a radio gap is checked against the device it was set up for
     // (OtherDeviceConnected). lastData: host time of its last data report.
     // The check runs on the probe thread (DeviceCheck), so it never holds up this one.
     bool checkDevice = false;
     bool checkPending = false;  // a DeviceCheck is queued or running
+    // A disconnect or stream gap clears this until the serial is confirmed again.
+    // Commands require confirmation only when multiple Watchman receivers match.
+    bool radioIdentityConfirmed = true;
     double lastData = 0;
+    uint64_t rxBytes = 0, rxReports = 0;      // link stats for Receivers(), rated each second
+    double rateT = 0; uint64_t rateBytes = 0, rateReports = 0;
+    double kBytesPerSec = 0, reportsPerSec = 0;
     // A receiver that doesn't answer the check is asked again until checkUntil, from nextCheck.
     double checkUntil = 0, nextCheck = 0;
   };
@@ -187,6 +203,18 @@ class UsbTransport {
   UsbTransportOptions opts_;
   ReportDecoder decoder_;
   RawCaptureWriter capture_;
+  // Doorman Dongles, one per USB serial, sorted by serial. The probe thread lists them
+  // (ScanDoorman); the reader thread opens and pumps them (PumpDoorman). Each stays until
+  // Stop(): an unplugged one closes (its devices detach) and reopens in place when it's back.
+  // The mutex guards the list and doormanFound_ only (each dongle locks itself): copy, then call.
+  mutable std::mutex doormanMutex_;
+  std::vector<std::shared_ptr<DoormanDongle>> doorman_;
+  std::optional<std::vector<DoormanDongleFound>> doormanFound_;  // the probe's last scan, not taken yet
+  std::set<std::string> doormanShared_;  // probe thread: USB serials several dongles share (warned once)
+  DoormanCarriers doormanCarriers_;      // reader thread: which dongle carries each device
+  std::vector<std::shared_ptr<DoormanDongle>> DoormanDongles() const;  // any thread
+  void ScanDoorman();            // probe thread
+  void PumpDoorman(double now);  // reader thread
   std::vector<Open> open_;
   // Receivers whose wireless device is not connected yet (owned by the probe thread)
   // and endpoints the probe thread finished setting up (handed to the reader thread).
@@ -219,7 +247,7 @@ class UsbTransport {
   bool TakePairing(Open& o);
   // The stock keepalive to a receiver with no device, each probe pass (logged when it changes).
   void KeepAlive(Open& o);
-  // #92: which device a wireless receiver has, asked by the probe thread on a handle of its own
+  // Which device a wireless receiver has, asked by the probe thread on a handle of its own
   // (the query can take ~0.1 s and the reader thread serves every device). path: the receiver's
   // interface; serial: the device it was set up for; result: 1 another device, 0 the same,
   // -1 no answer, unset while queued.

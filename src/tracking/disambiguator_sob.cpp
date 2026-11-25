@@ -29,20 +29,58 @@ void SobDisambiguator::Reset() {
   active_ = false;
 }
 
-void SobDisambiguator::SetKnownChannels(const std::map<int, std::pair<BaseConfig, BaseDynamicState>>& channels) {
+void SobDisambiguator::SetKnownChannels(const std::map<int, std::pair<BaseConfig, BaseDynamicState>>& channels,
+                                        std::bitset<kChannels> blocked) {
+  const auto changed = blocked_ ^ blocked;
+  blocked_ = blocked;
+  if (changed.any()) {
+    std::erase_if(configs_, [&](const auto& config) { return changed[config.second.sobChannel]; });
+  }
+  for (int ch = 0; ch < kChannels; ++ch) {
+    Channel& c = channels_[size_t(ch)];
+    if (!c.seen) continue;
+    if (changed[ch]) {
+      DiscardFrames(c);
+      c = Channel{};
+      continue;
+    }
+    const auto next = channels.find(ch);
+    const auto previous = known_.find(ch);
+    const bool withdrawn = previous != known_.end() && previous->second.first.serial == c.serial && next == channels.end();
+    const bool replaced = next != channels.end() && c.serial && c.serial != next->second.first.serial;
+    if (withdrawn || replaced) {
+      DiscardFrames(c);
+      c.serial = 0;
+    }
+    if (!c.serial && next != channels.end()) {
+      auto dynamic = next->second.second;
+      dynamic.cached = true;
+      Announce(c, ch, next->second.first, dynamic);
+    }
+  }
   known_ = channels;
-  for (const auto& [ch, base] : known_)
-    if (ch >= 0 && ch < kChannels && channels_[size_t(ch)].seen && channels_[size_t(ch)].serial == 0)
-      Announce(channels_[size_t(ch)], ch, base.first, base.second);
+}
+
+void SobDisambiguator::DiscardFrames(Channel& c) {
+  c.hits.clear();
+  std::erase_if(frames_, [&](const OpticalFrame& f) {
+    return f.uniqueBaseId == c.uniqueId || (c.serial && f.baseSerial == c.serial);
+  });
 }
 
 void SobDisambiguator::Announce(Channel& c, int channel, const BaseConfig& cfg, BaseDynamicState dyn) {
+  if (blocked_[size_t(channel)]) return;
   if (cfg.serial != c.serial) {
+    if (c.serial) DiscardFrames(c);
     char buf[96];
     snprintf(buf, sizeof buf, "SOB: channel %d is base %08X\n", channel + 1, cfg.serial);
     Log(buf);
   }
   c.serial = cfg.serial;
+  QueueConfig(channel, cfg, dyn);
+}
+
+void SobDisambiguator::QueueConfig(int channel, const BaseConfig& cfg, BaseDynamicState dyn) {
   dyn.sobChannel = channel;
   if (configs_.size() >= 16) configs_.pop_front();
   configs_.push_back({cfg, dyn});
@@ -70,7 +108,11 @@ void SobDisambiguator::OnBeamWord(double t, int channel, int ootxBit, int genera
     c.ootxBit = ootxBit;
     c.uniqueId = ++nextUniqueId_;
     c.ring.Init(443);
-    if (const auto k = known_.find(channel); k != known_.end()) Announce(c, channel, k->second.first, k->second.second);
+    if (const auto k = known_.find(channel); k != known_.end()) {
+      auto dynamic = k->second.second;
+      dynamic.cached = true;
+      Announce(c, channel, k->second.first, dynamic);
+    }
     char buf[64];
     snprintf(buf, sizeof buf, "SOB: add channel %d\n", channel + 1);
     Log(buf);
@@ -100,7 +142,7 @@ void SobDisambiguator::OnSensorWord(double t, int channel, int sensor, bool sort
   if (channel < 0 || channel >= kChannels || sensor < 0 || sensor >= 32) return;
   latest_ = std::max(latest_, t);
   Channel& c = channels_[size_t(channel)];
-  if (!c.seen || t < c.sync) return;
+  if (!c.seen || t < c.sync || blocked_[size_t(channel)]) return;
   // The next revolution's first hits can arrive before its beam word (the device reports
   // the word once decoded): keep them; only two periods without a word is a missed one.
   if (t - c.sync >= 2 * c.period) {
@@ -134,7 +176,7 @@ void SobDisambiguator::Skip(Channel& c, long revolutions) {
   if (revolutions <= 0) return;
   c.framer.Reset();  // the fast path needs an unbroken frame
   // The ring is one 443-slot lap: only the remainder moves it. Capping at 443 left it
-  // n % 443 slots out of step after a longer gap (#48.3).
+  // n % 443 slots out of step after a longer gap.
   for (long i = 0; i < revolutions % 443; ++i) { c.ring.Push(0xff); ++c.ringPushes; }
 }
 
@@ -143,6 +185,13 @@ void SobDisambiguator::PushOotx(Channel& c, int channel, int bit) {
   BaseDynamicState dyn;
   bool ok = false;
   if (bit >= 0 && c.framer.PushBit(bit != 0)) ok = ootx::DecodeFramer(c.framer, &cfg, &dyn);
+  if (blocked_[size_t(channel)]) {
+    // Keep intact optical reports for Session's freshness check on known stations.
+    // Combining bits across revolutions can mix stations sharing this channel.
+    if (bit < 0) c.framer.Reset();
+    else if (ok) QueueConfig(channel, cfg, dyn);
+    return;
+  }
   const bool decided = c.ring.Push(bit >= 0 ? bit : 0xff);
   // Retry when a slot gets decided, and once a lap (votes may have flipped a wrong bit).
   if (!ok && c.ring.Complete() && (decided || ++c.ringPushes % 443 == 0)) {
@@ -153,7 +202,7 @@ void SobDisambiguator::PushOotx(Channel& c, int channel, int bit) {
 }
 
 void SobDisambiguator::Emit(Channel& c, int channel, double next, bool nextReal) {
-  (void)channel;
+  if (blocked_[size_t(channel)]) return;
   // This revolution's hits; later ones (the next revolution's, reported before its beam
   // word) stay for it.
   std::vector<Hit> hits, later;

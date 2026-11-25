@@ -15,6 +15,10 @@ short). Don't add other Markdown outside `ai/`.
 * **lhbs** (`basestation_firmware/`): a readable reimplementation of the HTC Lighthouse 1.0
   base station firmware (NXP LPC11U37), with an optical multi-station mode for more than
   two bases (TDM time slots).
+* **doorman** (`doorman/`): openhouse's own wireless link: nRF52840 dongle firmware (6 devices per
+  dongle) and radio firmware for the Vive Tracker 1.0 (nRF51) and the Index controller family (nRF52),
+  installed over USB with SteamVR's own updater; host side in `doorman_dongle.cpp` and
+  `apps/doorman-dongle-manager`. Start at `doorman/README.md`.
 
 Goals and constraints (from the owner):
 * Tracking algorithms and constants start from the original (oracle-tested), but use
@@ -51,12 +55,13 @@ Goals and constraints (from the owner):
 | `src/openvr` | the OpenVR driver (devices, inputs, skeleton, host frame, room publisher, stock HMD, pairing, telemetry server) |
 | `src/common` | small shared pieces (loopback sockets) |
 | `src/platform` | OS helpers (paths, precise sleep) |
-| `apps/` | `openhouse-viewer` (live status of the running driver, bug report button), `openhouse-compare` (openhouse vs the stock driver side by side; hosts the stock DLL in-process), `lhtool` (replay/session/track), `lhcapture` (recorder), `lhviz` (developer viewer), `openhouse-check` (update check), `example_app` (standalone CMake example for users of `lh::Session`) |
+| `apps/` | `openhouse-overlay` (management app: SteamVR dashboard overlay or desktop window; live status, settings, bug report), `openhouse-compare` (openhouse vs the stock driver side by side; hosts the stock DLL in-process), `lhtool` (replay/session/track), `lhcapture` (recorder), `lhviz` (developer viewer), `update-checker` (update check), `doorman-dongle-manager` (doorman dongle manager; shipped as a plain binary, not installed), `example_app` (standalone CMake example for users of `lh::Session`) |
 | `tests/` | unit, runtime, OpenVR component/mock-host, oracle tests (load the original binary) |
 | `tools/` | `eval_replay.sh/.py` (tracking scorer) |
-| `scripts/` | Release builds (`build-linux.sh`, `build-windows.sh`, `build-firmware.sh`) and the packagers they call (`package-linux.sh`, `package-driver.py`, `package-windows.py`, `package-firmware.py`), the Windows installer script |
+| `scripts/` | Release builds (`build-linux.sh`, `build-windows.sh`, `build-firmware.sh`, `build-doorman.sh`) and the packagers they call (`package-linux.sh`, `package-driver.py`, `package-windows.py`), and `stage-firmwares.py` (every firmware image into a package's `firmwares/`, for openhouse-installer) |
 | `basestation_firmware` | the firmware (`src/`, `test/`, `Makefile`); `tools/lpcsum.py` (boot checksum, run by the Makefile); `installer/` the end-user installers (Linux sh, Windows ps1/bat). `fw/`, `patches/`, `re/`, `bsfirmwares/`, `backups/` are local only |
-| `re/ghidra_scripts` | headless Ghidra scripts. The rest of `re/` (project, decompiles) is local only |
+| `doorman` | doorman wireless: `dongle-fw/`, `radio-fw/`, `common/` (shared protocol headers), `tools/` (Python: dongle CLI, air/OTA updaters, radio emulator), `third_party/` (the tinyusb/nrfx/CMSIS files the builds use) |
+| `re/` | local only: headless Ghidra scripts, project, decompiles |
 
 Not in git, on purpose: Valve's binaries, decompiled code, HTC firmware images and flash
 dumps, `libsurvive/` (reference only: LH2 polynomials and decode), recordings.
@@ -78,6 +83,8 @@ Release packages (each builds and packages; nothing is installed):
   `package-linux.sh` alone packages whatever `build-release` holds; it doesn't build.
 * `scripts/build-windows.sh`: MinGW cross-build (`driver/windows_build.md`).
 * `scripts/build-firmware.sh`: lhbs + host test + installers.
+* `scripts/build-doorman.sh`: dongle + radio firmware, radio emulator test, `dist/openhouse-doorman.zip`
+  (`doorman/README.md`). Needs `arm-none-eabi-gcc`; `uv` for the emulator.
 
 Packaging deletes `dist/openhouse-driver/` (and the Windows/firmware dirs): move anything
 the owner keeps there first. The version is `include/lh/version.hpp`, kept in sync with
@@ -101,7 +108,7 @@ Captures (owner's machine; ask for them if absent):
 
 Logs and diagnostics: every message has a level (DEBUG/INFO/WARN/ERR). Replays print
 them with `lhtool session` (`"level"` field); live, the host log gets INFO+ unless
-`LH_LOG_LEVEL=DEBUG`, and `openhouse-viewer` shows everything. Recording inside the host:
+`LH_LOG_LEVEL=DEBUG`, and `openhouse-overlay`'s Debug page shows everything. Recording inside the host:
 `LH_CAPTURE=DIR` or `capture` under `driver_lighthouse` in `steamvr.vrsettings`; the
 recording has `driver.jsonl` (what the driver did and logged) next to `input.lhraw`.
 
@@ -112,10 +119,12 @@ Four LH1 bases on lhbs multi-station: slots 1-4 = E236DC40 (master), A101B835, D
 "calibration-rescue-244" firmware and restored from a flash backup: **never suggest that
 firmware**. Devices: Index controllers (LHR-13DA81D1 right, LHR-8F9BE6F2 left), trackers,
 a Vive headset (LHR-0704E07A). Quest Pro through WiVRn for VRChat.
-Alignment tools can read the room from `/openhouse-room-<uid>` on Linux or `Local\openhouse-room` on Windows (`include/lh/room_shm.h`;
+Alignment tools can read the room from `/openhouse-room-<uid>` (`include/lh/room_shm.h`;
 copies of that header in other projects must stay identical).
 
 ## State of the work (2026-11-10)
+
+doorman (2026-11-19): working on hardware, 6 devices on one dongle; open items in `doorman/README.md`.
 
 Version 1.0.3 (`include/lh/version.hpp`; v1.0.1 shipped still saying 1.0.0). Recent work:
 * Rooms: one "learned" rule (`BaseStationState::learned`) drives settling, SteamVR base
@@ -136,7 +145,7 @@ Version 1.0.3 (`include/lh/version.hpp`; v1.0.1 shipped still saying 1.0.0). Rec
 * Bug reports: replay `recording/*.lhraw` with `lhtool session ... --room COPY_OF config/roommap.json
   --steam-db - --preinit - --trace OUT`. Mid-session recordings decode only with the Wv2
   probes (`driver/wireless_protocol.md`); older builds see almost nothing in them.
-* `openhouse-check` (SteamVR autolaunch app; Monado/WiVRn: a user service) warns when a
+* `update-checker` (SteamVR autolaunch app; Monado/WiVRn: a user service) warns when a
   SteamVR update replaced the driver, then asks GitHub's latest release and offers it
   ("Ok" / "Open link"; zenity/kdialog, MessageBox; `OPENHOUSE_NO_UPDATE_CHECK`).
 * Installers (`apps/openhouse-installer` on Windows, `packaging/*.sh`): offer to close Steam /
@@ -200,5 +209,9 @@ Open:
 `firmware/` (lhbs): `usage.md` (build, flash, console; end users: `basestation_firmware/installer`), `FIRMWARE_OVERVIEW.md`,
 `HARDWARE.md` (pin map, peripherals, verification log), `MULTISTATION.md` (TDM slots,
 open issues).
+
+`doorman/` (wireless): `README.md` (overview, layout, build, safety rules, state), `protocol.md`
+(air link, dongle USB commands, device frames), `dongle-fw.md`, `radio-fw.md` (updater, every update
+route), `host.md` (transport, receivers/pairing, doorman-dongle-manager).
 
 `reverse_engineering.md`: the Ghidra workspace for `driver_lighthouse.so` (local only).

@@ -1,6 +1,7 @@
 #include "room_publisher.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -19,6 +20,23 @@
 #endif
 
 namespace lh::openvr {
+namespace {
+// The heartbeat clock (room_shm.h): CLOCK_MONOTONIC on Linux, QueryPerformanceCounter on Windows.
+double MonotonicSeconds() {
+#ifdef _WIN32
+  LARGE_INTEGER now, frequency;
+  QueryPerformanceCounter(&now);
+  QueryPerformanceFrequency(&frequency);
+  return double(now.QuadPart) / double(frequency.QuadPart);
+#elif defined(__linux__)
+  timespec ts{};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return double(ts.tv_sec) + 1e-9 * double(ts.tv_nsec);
+#else
+  return 0;
+#endif
+}
+}  // namespace
 
 bool RoomSettle::Close(const Eigen::Isometry3d& a, const Eigen::Isometry3d& b, double m, double rad) {
   const double d = (a.translation() - b.translation()).norm();
@@ -65,8 +83,8 @@ void RoomPublisher::Close() {
     shm_->beat = 0;
     UnmapViewOfFile(shm_);
   }
-  if (map_) CloseHandle(static_cast<HANDLE>(map_));
-  map_ = nullptr;
+  if (mapping_) CloseHandle(mapping_);  // the mapping goes with its last handle
+  mapping_ = nullptr;
 #endif
   shm_ = nullptr;
   failed_ = false;
@@ -91,12 +109,14 @@ bool RoomPublisher::Open() {
   return true;
 #elif defined(_WIN32)
   if (shm_ || failed_) return shm_ != nullptr;
-  HANDLE h = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(sizeof(openhouse_room)),
-                                OPENHOUSE_ROOM_WIN_NAME);
-  if (!h) { failed_ = true; return false; }
-  void* m = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(openhouse_room));
-  if (!m) { CloseHandle(h); failed_ = true; return false; }
-  map_ = h;
+  // Local\: this logon session's namespace, the Windows counterpart of the uid suffix.
+  path_ = OPENHOUSE_ROOM_WIN32_NAME;
+  HANDLE mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(sizeof(openhouse_room)),
+                                      path_.c_str());
+  if (!mapping) { failed_ = true; return false; }
+  void* m = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(openhouse_room));
+  if (!m) { CloseHandle(mapping); failed_ = true; return false; }
+  mapping_ = mapping;
   shm_ = static_cast<openhouse_room*>(m);
   std::memset(shm_, 0, sizeof *shm_);
   shm_->magic = OPENHOUSE_ROOM_MAGIC;
@@ -148,16 +168,14 @@ void RoomPublisher::Publish(const SessionSnapshot& snapshot, const Eigen::Isomet
   }
 #if defined(__linux__) || defined(_WIN32)
   if (!Open()) return;
-  auto* seq = reinterpret_cast<volatile uint32_t*>(&shm_->seq);
-  __atomic_store_n(&shm_->seq, *seq + 1, __ATOMIC_RELEASE);
-  __atomic_thread_fence(__ATOMIC_SEQ_CST);
-#ifdef _WIN32
-  shm_->beat = double(GetTickCount64()) / 1000.0;
-#else
-  timespec ts{};
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  shm_->beat = double(ts.tv_sec) + 1e-9 * double(ts.tv_nsec);
-#endif
+  // Seqlock (room_shm.h): odd while a write is in progress, so a reader can tell a torn
+  // read. atomic_ref is the portable spelling of the __atomic_* builtins this used, which
+  // GCC and Clang have but MSVC does not; the field itself is a plain uint32_t in shared
+  // memory, which atomic_ref requires to be naturally aligned (it is).
+  std::atomic_ref<uint32_t> seq(shm_->seq);
+  seq.fetch_add(1, std::memory_order_release);
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  shm_->beat = MonotonicSeconds();
   shm_->epoch = settle_.epoch();
   shm_->settled = settled;
   std::snprintf(shm_->room, sizeof shm_->room, "%s", snapshot.roomId.c_str());
@@ -177,8 +195,8 @@ void RoomPublisher::Publish(const SessionSnapshot& snapshot, const Eigen::Isomet
     out.sigma = b.sigma;
   }
   shm_->count = n;
-  __atomic_thread_fence(__ATOMIC_SEQ_CST);
-  __atomic_store_n(&shm_->seq, *seq + 1, __ATOMIC_RELEASE);
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  seq.fetch_add(1, std::memory_order_release);
 #else
   (void)settled;
 #endif

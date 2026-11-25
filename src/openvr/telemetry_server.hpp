@@ -40,6 +40,18 @@ class TelemetryServer {
   void Log(double time, LogLevel level, const std::string& serial, const std::string& text);
   void PublishState(double time, const SessionSnapshot& snapshot, const std::vector<DeviceUpdate>& updates,
                     const std::vector<Session::Receiver>& receivers, const RoomStatus& room);
+  // The driver's settings as the overlay shows them: a JSON object, sent in every state.
+  void SetSettings(std::string json);
+
+  // Commands from clients (openhouse-overlay): one JSON object per line,
+  // {"type":"command","id":N,"cmd":"...", ...}. The driver takes them on its own thread
+  // and answers each with Reply(): {"type":"reply","id":N,"ok":B,"error":"..."}.
+  struct Command {
+    uint64_t client = 0;
+    std::string json;
+  };
+  std::vector<Command> TakeCommands();
+  void Reply(uint64_t client, const std::string& json);
 
   static constexpr std::size_t kBacklog = 2000;            // log lines a new client gets
   static constexpr std::size_t kMaxQueued = 8 << 20;       // bytes
@@ -48,7 +60,11 @@ class TelemetryServer {
   struct Client {
     net::Socket socket = net::kInvalid;
     std::string out;
+    std::string in;  // a command line still arriving
+    uint64_t id = 0;
   };
+  static constexpr std::size_t kMaxCommand = 64 << 10;  // bytes: longer lines drop the client
+  static constexpr std::size_t kMaxPending = 256;        // commands not taken yet
   void Main();
   void Broadcast(const std::string& line);  // under mutex_
 
@@ -56,6 +72,9 @@ class TelemetryServer {
   std::condition_variable wake_;
   std::vector<Client> clients_;
   std::deque<std::string> backlog_;
+  std::vector<Command> commands_;
+  std::string settings_ = "{}";
+  uint64_t nextClient_ = 1;
   net::Socket listener_ = net::kInvalid;
   std::string host_;
   std::thread thread_;

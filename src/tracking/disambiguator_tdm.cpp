@@ -210,7 +210,7 @@ int TdmDisambiguator::RetrySensorType() {
         d = std::min(d, 1.0 - d);
         if (d < kClusterTol) {
           // Its phase into the sum too (it was only counted, so the average halved and no
-          // cluster ever reached a lock, #48.2), unwrapped next to the average.
+          // cluster ever reached a lock), unwrapped next to the average.
           double x = ph;
           if (x - avg > 0.5) x -= 1.0;
           else if (avg - x > 0.5) x += 1.0;

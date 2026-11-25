@@ -44,6 +44,46 @@ std::vector<int> Sensors(const std::vector<lh::OpticalFrame>& frames, double syn
 
 }  // namespace
 
+TEST(SobDisambiguator, ConflictedChannelDiscardsQueuedHitsAndCanResume) {
+  lh::sob::SobDisambiguator decoder;
+  lh::BaseConfig first, second;
+  first.serial = 1;
+  second.serial = 2;
+  first.valid = second.valid = true;
+  const std::map<int, std::pair<lh::BaseConfig, lh::BaseDynamicState>> channels{
+      {0, {first, {}}}, {1, {second, {}}}};
+  const auto sweep = [&](double start, int channel) {
+    const double period = lh::sob::kPeriodTicks[size_t(channel)] * lh::sob::kTickSeconds;
+    decoder.OnBeamWord(start, channel, 0, 0);
+    decoder.OnSensorWord(start + 0.2 * period, channel, 0);
+    decoder.OnBeamWord(start + period, channel, 0, 0);
+  };
+
+  decoder.SetKnownChannels(channels);
+  sweep(1.0, 0);
+  sweep(1.0, 1);
+  lh::BaseConfig announced;
+  lh::BaseDynamicState dynamic;
+  ASSERT_TRUE(decoder.PopBaseConfig(&announced, &dynamic));
+  EXPECT_TRUE(dynamic.cached);
+  decoder.SetKnownChannels({{1, channels.at(1)}}, std::bitset<lh::sob::kChannels>{1});
+  EXPECT_EQ(decoder.ChannelSerial(0), 0u);
+  EXPECT_EQ(decoder.ChannelSerial(1), second.serial);
+  sweep(1.1, 0);
+  decoder.Advance(1.2);
+  lh::OpticalFrame frame;
+  ASSERT_TRUE(decoder.PopFrame(&frame));
+  EXPECT_EQ(frame.baseSerial, second.serial);
+  EXPECT_FALSE(decoder.PopFrame(&frame));
+
+  decoder.SetKnownChannels(channels);
+  sweep(1.3, 0);
+  decoder.Advance(1.4);
+  ASSERT_TRUE(decoder.PopFrame(&frame));
+  EXPECT_EQ(frame.baseSerial, first.serial);
+  EXPECT_FALSE(decoder.PopFrame(&frame));
+}
+
 TEST(SobDisambiguator, EveryRevolutionWithItsBeamWordKeepsItsOwnHits) {
   const auto frames = Decode({});
   const double period = double(lh::sob::kPeriodTicks[0]) * lh::sob::kTickSeconds;

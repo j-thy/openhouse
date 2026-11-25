@@ -121,7 +121,7 @@ TEST(WirelessReconnect, ResetsProtocolClockAndImuEpoch) {
 
 }  // namespace
 
-// #41: a section announced longer than the packet made Decode memcpy a negative length.
+// A section announced longer than the packet made Decode memcpy a negative length.
 TEST(Wv2Decoder, RejectsSectionsLongerThanThePacket) {
   // meta + light, the meta section announced as 16 bytes in a 6-byte packet.
   const uint8_t metaLight[6] = {0x00, 0x40 | 0x10 | 0x0f, 0x00, 0x00, 0x00, 0x00};

@@ -5,8 +5,8 @@
 `scripts/build-windows.sh` builds and packages:
 
 * `build-win64/openvr/lighthouse/bin/win64/driver_lighthouse.dll`;
-* `apps/`: `liblh.dll`, `openhouse-viewer.exe`, `openhouse-compare.exe`, `lhviz.exe`,
-  `lhtool.exe`, `lhcapture.exe`, `openhouse-check.exe`; `openhouse-installer.exe` at the top;
+* `apps/`: `liblh.dll`, `openhouse-overlay.exe`, `openhouse-compare.exe`, `lhviz.exe`,
+  `lhtool.exe`, `lhcapture.exe`, `update-checker.exe`; `openhouse-installer.exe` at the top;
 * `dist/openhouse-windows-x64.zip`: stripped binaries, `LICENSE.txt`, dependency notices
   (`licenses/`), `BUILD.json` (hashes), the settings page schema, and the installer.
 
@@ -73,7 +73,7 @@ ctest --test-dir build-msvc --output-on-failure
 
 MSVC needs the code to stay off GCC-only and POSIX-only spellings: `__attribute__` behind
 `__GNUC__`, no `<unistd.h>`/`getpid`/`mkstemp` in tests (`platform::ProcessId`, the temp
-directory), `openhouse-check` (a GUI app with `main`) links with
+directory), `update-checker` (a GUI app with `main`) links with
 `/ENTRY:mainCRTStartup`, `-municode` is for MinGW only (MSVC starts `wmain` itself), and
 the linker's own manifest is off (`/MANIFEST:NO`) because the `.rc` already embeds one.
 The first configure builds Ceres and friends (~15 min). The shared library is `lh.dll`
@@ -87,7 +87,7 @@ uninstall; `--install`, `--uninstall`, `--status`, `--steamvr PATH`, `--yes`. It
 to close Steam / SteamVR (they hold the DLL open), overwrites with retries, keeps the stock DLL as
 `driver_lighthouse.dll.stock` (needed for the headset display), verifies the installed
 hash, installs the settings page schema (an existing one is kept as `.stock`), and
-registers the update check (`openhouse-check.exe` in `%LOCALAPPDATA%\openhouse`,
+registers the update check (`update-checker.exe` in `%LOCALAPPDATA%\openhouse`,
 autolaunched overlay). SteamVR is found through OpenVR's runtime path file, then
 Steam's registry path; `--steamvr` overrides. Whenever the installed DLL lacks the
 marker `liblh session started` it is SteamVR's (a newer one after an update) and becomes

@@ -31,13 +31,19 @@ class TrackingSource {
   bool PeekImuTime(DeviceTime* out) const;
   bool PopFrame(OpticalFrame* out);
   const tdm::TdmStats& Stats() const { return tdm_.Stats(); }
+  bool PopSobBaseConfig(BaseConfig* config, BaseDynamicState* dynamic);
   bool PopBaseConfig(BaseConfig* config, BaseDynamicState* dynamic);
   bool PopEvent(tdm::TdmEvent* out);
   bool PopLog(std::string* out);
   // Fast base identification (see TdmDisambiguator::Identity).
   void SetKnownIdentities(std::vector<tdm::TdmDisambiguator::Identity> identities);
+  // Whether the stations run a multi-station round (lhbs), as this device found it; and the
+  // session's answer, shared with every device.
+  bool MultiLayout() const { std::lock_guard lock(mutex_); return multi_.LayoutKnown(); }
+  void SetMultiLayout(bool known) { std::lock_guard lock(mutex_); if (multi_.LayoutKnown() != known) multi_.SetLayoutKnown(known); }
   bool PopIdentity(tdm::TdmDisambiguator::Identity* out);
-  void SetKnownSobChannels(const std::map<int, std::pair<BaseConfig, BaseDynamicState>>& channels);
+  void SetKnownSobChannels(const std::map<int, std::pair<BaseConfig, BaseDynamicState>>& channels,
+                           std::bitset<sob::kChannels> blocked = {});
 
   // Not stock, for rooms with both kinds of base station (ai/driver/mixed_stations.md): LH1
   // pulses from 2.0 stations go down the LH2 path (PulseSorter), the rest down the LH1 path as

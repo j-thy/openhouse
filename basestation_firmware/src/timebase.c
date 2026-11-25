@@ -618,8 +618,17 @@ void timebase_supervisor(void)
     cable_switch();
     const bool hears = cable_locked ||
                        (slave_mode() && (P.corr_status == CS_SYNCING || P.corr_status == CS_LOCKED));
-    if (P.sys_standby && (cable_locked || (slave_mode() && P.corr_status == CS_LOCKED)))
+    /* Woken by the master only once it was gone since this stand-by began: SteamVR turns every
+     * station off, not all at once, and a slave told to while its master still flashed was woken
+     * by it at once (rotors up), then lost it and timed out a minute later. */
+    static bool was_standby, master_gone;
+    if (P.sys_standby && !was_standby) master_gone = false;
+    was_standby = P.sys_standby;
+    if (P.sys_standby && !hears) master_gone = true;
+    if (P.sys_standby && master_gone && (cable_locked || (slave_mode() && P.corr_status == CS_LOCKED))) {
         timebase_exit_standby();
+        was_standby = false;
+    }
     if (timebase_permits_emission() || P.sys_standby || hears) last_lock_ms = sys_ms();
     else if (sys_ms() - last_lock_ms > 60000u) P.sys_standby = true;
 }

@@ -20,6 +20,9 @@
 #include <string>
 #include <thread>
 
+#include "platform/platform.hpp"
+#include "common/crash_log.hpp"
+#include "common/ui_name_fonts.hpp"
 #include "lh/bug_report.hpp"
 #include "lh/telemetry.hpp"
 #include "log_view.hpp"
@@ -30,16 +33,7 @@ namespace {
 using namespace openhouse::viewer;
 using json = nlohmann::json;
 
-std::filesystem::path SettingsPath() {
-#ifdef _WIN32
-  const char* base = std::getenv("APPDATA");
-  return std::filesystem::path(base ? base : ".") / "lh" / "viewer.json";
-#else
-  if (const char* xdg = std::getenv("XDG_CONFIG_HOME"); xdg && *xdg) return std::filesystem::path(xdg) / "lh" / "viewer.json";
-  const char* home = std::getenv("HOME");
-  return std::filesystem::path(home ? home : ".") / ".config" / "lh" / "viewer.json";
-#endif
-}
+std::filesystem::path SettingsPath() { return lh::platform::FsPath(lh::platform::ConfigDirectory()) / "viewer.json"; }
 
 struct Settings {
   Detail detail = Detail::Basic;
@@ -127,6 +121,7 @@ void Section(const char* title) {
 }  // namespace
 
 int main() {
+  lh::crash::Install("openhouse-viewer");
   if (!glfwInit()) {
     std::fprintf(stderr, "openhouse-viewer: no display\n");
     return 1;
@@ -137,7 +132,10 @@ int main() {
   glfwSwapInterval(1);
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
-  ImGui::GetIO().IniFilename = nullptr;  // our own settings file; the layout is fixed
+  ImGuiIO& io = ImGui::GetIO();
+  io.IniFilename = nullptr;  // our own settings file; the layout is fixed
+  io.Fonts->AddFontDefault();
+  lh::ui::MergeTrackerNameFonts(*io.Fonts);
   ImGui::StyleColorsDark();
   ImGui::GetStyle().WindowRounding = 0;
   ImGui::GetStyle().FrameRounding = 3;

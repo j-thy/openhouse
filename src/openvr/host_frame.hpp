@@ -28,12 +28,25 @@ class HostFrame {
   const Eigen::Isometry3d& Update(const SessionSnapshot& snapshot, double now);
   bool Anchored() const { return anchored_; }
 
+  // Room calibration (openhouse-overlay, for runtimes without SteamVR's Room Setup): a turn
+  // about the vertical and a shift applied on top of the pinned frame, per room, saved in
+  // hostframe.json. Identity until set. The current room's (none: identity).
+  Eigen::Isometry3d Calibration() const;
+  bool SetCalibration(const Eigen::Isometry3d& calibration);  // false: no anchored room
+  // The pinned frame without the calibration (what the calibration is applied to).
+  const Eigen::Isometry3d& Pinned() const { return pinned_; }
+
  private:
-  struct Anchor { std::string base; Eigen::Isometry3d pose = Eigen::Isometry3d::Identity(); };
+  struct Anchor {
+    std::string base;
+    Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+    Eigen::Isometry3d calibration = Eigen::Isometry3d::Identity();
+  };
   void Save() const;
   std::string path_;
   std::map<std::string, Anchor> anchors_;  // by room id
   Eigen::Isometry3d rawFromWorld_ = Eigen::Isometry3d::Identity();
+  Eigen::Isometry3d pinned_ = Eigen::Isometry3d::Identity();  // rawFromWorld_ without the calibration
   bool anchored_ = false;
   // A first anchor waits for the origin to hold still (the session's first level).
   uint64_t originEpoch_ = 0;

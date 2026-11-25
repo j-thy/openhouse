@@ -137,6 +137,11 @@ bool TrackingSource::PopFrame(OpticalFrame* out) {
   return UseMulti() ? multi_.PopFrame(out) : tdm_.PopFrame(out);
 }
 
+bool TrackingSource::PopSobBaseConfig(BaseConfig* config, BaseDynamicState* dynamic) {
+  std::lock_guard lock(mutex_);
+  return sob_.PopBaseConfig(config, dynamic);
+}
+
 bool TrackingSource::PopBaseConfig(BaseConfig* config, BaseDynamicState* dynamic) {
   std::lock_guard lock(mutex_);
   if (sob_.PopBaseConfig(config, dynamic)) return true;
@@ -175,9 +180,10 @@ void TrackingSource::SetKnownIdentities(std::vector<tdm::TdmDisambiguator::Ident
   tdm_.SetKnownIdentities(std::move(identities));
 }
 
-void TrackingSource::SetKnownSobChannels(const std::map<int, std::pair<BaseConfig, BaseDynamicState>>& channels) {
+void TrackingSource::SetKnownSobChannels(const std::map<int, std::pair<BaseConfig, BaseDynamicState>>& channels,
+                                         std::bitset<sob::kChannels> blocked) {
   std::lock_guard lock(mutex_);
-  sob_.SetKnownChannels(channels);
+  sob_.SetKnownChannels(channels, blocked);
 }
 
 bool TrackingSource::PopIdentity(tdm::TdmDisambiguator::Identity* out) {

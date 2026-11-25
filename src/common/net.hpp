@@ -14,8 +14,11 @@ constexpr Socket kInvalid = -1;
 Socket ListenLoopback(int port, std::string* error = nullptr);
 // A pending connection, non-blocking, or kInvalid when there is none.
 Socket Accept(Socket listener);
-// A blocking connect to 127.0.0.1:port (the caller retries), then non-blocking.
+// Starts a non-blocking connect to 127.0.0.1:port; kInvalid if it failed right away. Poll it with
+// ConnectDone until it's 1 (connected) or -1 (refused: close it, the caller retries). Never blocks:
+// on Windows a refused loopback connect takes ~2 s to fail.
 Socket ConnectLoopback(int port);
+int ConnectDone(Socket socket);
 // Bytes sent (0: would block), or -1 when the peer is gone.
 long SendSome(Socket socket, const char* data, std::size_t size);
 // Bytes read, 0 when nothing is waiting, or -1 when the peer closed or failed.

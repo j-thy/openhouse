@@ -75,11 +75,33 @@ Socket ConnectLoopback(int port) {
   if (!Started()) return kInvalid;
   const Socket s = Socket(socket(AF_INET, SOCK_STREAM, 0));
   if (s == kInvalid) return kInvalid;
-  const sockaddr_in a = Loopback(port);
-  if (connect(s, reinterpret_cast<const sockaddr*>(&a), sizeof a) != 0) { Close(s); return kInvalid; }
   NonBlocking(s);
   NoDelay(s);
+  const sockaddr_in a = Loopback(port);
+  if (connect(s, reinterpret_cast<const sockaddr*>(&a), sizeof a) != 0) {
+#ifdef _WIN32
+    const bool pending = WSAGetLastError() == WSAEWOULDBLOCK;
+#else
+    const bool pending = errno == EINPROGRESS;
+#endif
+    if (!pending) { Close(s); return kInvalid; }
+  }
   return s;
+}
+
+int ConnectDone(Socket socket) {
+  fd_set w, e;
+  FD_ZERO(&w); FD_ZERO(&e);
+  FD_SET(socket, &w); FD_SET(socket, &e);
+  timeval zero{};
+  const int n = select(int(socket) + 1, nullptr, &w, &e, &zero);
+  if (n < 0) return -1;
+  if (n == 0) return 0;
+  int err = 0;
+  socklen_t len = sizeof err;
+  if (getsockopt(socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len) != 0 || err != 0 || FD_ISSET(socket, &e))
+    return -1;
+  return 1;
 }
 
 long SendSome(Socket socket, const char* data, std::size_t size) {

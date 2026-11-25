@@ -306,8 +306,8 @@ std::string StockHost::FindDriver() {
   std::error_code ec;
   if (std::filesystem::exists(dir / stock, ec)) return (dir / stock).string();
   // No installer copy: the installed one is stock unless it's ours, which carries the line it
-  // logs on start (the installers and openhouse-check test the same; lh-dependencies.json,
-  // tested before, is never in SteamVR's folder, #54.1).
+  // logs on start (the installers and update-checker test the same; lh-dependencies.json,
+  // tested before, is never in SteamVR's folder).
   if (!std::filesystem::exists(dir / original, ec)) return "";
   std::ifstream in(dir / original, std::ios::binary);
   if (!in) return "";

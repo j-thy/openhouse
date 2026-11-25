@@ -110,7 +110,7 @@ void TelemetryServer::PublishState(double time, const SessionSnapshot& snapshot,
   for (const auto& b : snapshot.bases) {
     const auto& p = b.worldFromBase.position;
     const auto& q = b.worldFromBase.orientation;
-    bases.push_back({{"serial", b.serial}, {"channel", b.channel}, {"mode", b.mode}, {"seen", b.seen}, {"placed", b.known},
+    bases.push_back({{"serial", b.serial}, {"channel", b.channel}, {"mode", b.mode}, {"lh2", b.lh2}, {"channelObservedAt", b.channelObservedAt}, {"seen", b.seen}, {"placed", b.known},
                      {"origin", b.origin}, {"locked", b.locked}, {"observations", b.observations},
                      {"sigma", b.sigma}, {"learned", b.known && b.learned},
                      {"status", !b.seen && !b.known ? "not seen" : !b.known ? "not placed" : b.learned ? "learned" : "learning"},
@@ -146,15 +146,47 @@ void TelemetryServer::PublishState(double time, const SessionSnapshot& snapshot,
                        {"coverage", coverage}, {"basesSeen", seeing}, {"result", ResultName(pose.result)}});
   }
   json rx = json::array();
-  for (const auto& r : receivers) rx.push_back({{"serial", r.serial}, {"connected", r.connected}});
+  for (const auto& r : receivers) {
+    json e = {{"serial", r.serial}, {"connected", r.connected}, {"kind", r.kind}, {"linked", r.linked},
+              {"kBytesPerSec", r.kBytesPerSec}, {"framesPerSec", r.framesPerSec}};
+    if (r.slot >= 0) {   // a Doorman Dongle slot
+      e["slot"] = r.slot; e["paired"] = r.paired; e["loss"] = r.lossPercent; e["drops"] = r.dropsPerSec;
+      e["rssi"] = {r.rssiDongle, r.rssiDevice};
+    }
+    rx.push_back(std::move(e));
+  }
   const std::string line =
       json{{"type", "state"}, {"t", time},
            {"room", {{"id", snapshot.roomId}, {"settled", room.settled}, {"epoch", room.epoch}, {"settleSigma", room.settleSigma},
                      {"resets", room.resets}, {"learned", learned}, {"seen", seenBases}}},
            {"bases", bases}, {"devices", devices}, {"receivers", rx}}
-          .dump(-1, ' ', false, json::error_handler_t::replace) + "\n";
+          .dump(-1, ' ', false, json::error_handler_t::replace);
   std::lock_guard lock(mutex_);
-  Broadcast(line);
+  // The settings object goes in as it was set (the driver built it as JSON).
+  Broadcast(line.substr(0, line.size() - 1) + ",\"settings\":" + settings_ + "}\n");
+}
+
+void TelemetryServer::SetSettings(std::string text) {
+  const json j = json::parse(text, nullptr, false);
+  if (!j.is_object()) return;
+  std::lock_guard lock(mutex_);
+  settings_ = j.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
+std::vector<TelemetryServer::Command> TelemetryServer::TakeCommands() {
+  std::lock_guard lock(mutex_);
+  std::vector<Command> out;
+  out.swap(commands_);
+  return out;
+}
+
+void TelemetryServer::Reply(uint64_t client, const std::string& text) {
+  std::lock_guard lock(mutex_);
+  for (auto& c : clients_)
+    if (c.id == client && c.out.size() <= kMaxQueued) {
+      c.out += text + "\n";
+      wake_.notify_all();
+    }
 }
 
 void TelemetryServer::Main() {
@@ -165,6 +197,7 @@ void TelemetryServer::Main() {
         Client c{s, json{{"type", "hello"}, {"protocol", telemetry::kProtocolVersion}, {"name", "openhouse"}, {"version", lh::kVersion}, {"host", host_},
                          {"pid", int(LH_GETPID())}}.dump() + "\n"};
         for (const auto& line : backlog_) c.out += line;
+        c.id = nextClient_++;
         clients_.push_back(std::move(c));
       }
       for (auto it = clients_.begin(); it != clients_.end();) {
@@ -175,8 +208,19 @@ void TelemetryServer::Main() {
           else if (n == 0) break;
           else it->out.erase(0, size_t(n));
         }
-        char sink[256];  // clients send nothing; this notices a closed one
-        if (!drop && net::RecvSome(it->socket, sink, sizeof sink) < 0) drop = true;
+        // What a client sends: command lines (it also notices a closed client).
+        char chunk[4096];
+        for (int reads = 0; !drop && reads < 16; ++reads) {
+          const long n = net::RecvSome(it->socket, chunk, sizeof chunk);
+          if (n < 0) drop = true;
+          if (n <= 0) break;
+          it->in.append(chunk, size_t(n));
+        }
+        size_t start = 0;
+        for (size_t nl; !drop && (nl = it->in.find('\n', start)) != std::string::npos; start = nl + 1)
+          if (commands_.size() < kMaxPending) commands_.push_back({it->id, it->in.substr(start, nl - start)});
+        it->in.erase(0, start);
+        if (it->in.size() > kMaxCommand) drop = true;
         if (drop) { net::Close(it->socket); it = clients_.erase(it); }
         else ++it;
       }

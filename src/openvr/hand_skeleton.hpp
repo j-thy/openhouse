@@ -18,6 +18,12 @@ class HandSkeleton {
   bool Load(const std::string& glovePoses, bool left, std::string* error);
   // Advances the smoothing and thumb fades by `seconds` with the latest input.
   void Update(const ControllerInput& input, double seconds);
+  // A Vive wand: no finger sensors, so the index bends as far as the trigger is pulled
+  // (on an Index any pull closes it all the way: the finger is already round the trigger).
+  void SetIndexFromTrigger(bool on) { indexFromTrigger_ = on; }
+  // The controller's orientation as apps see it (w, x, y, z; y up), for the open hand's rest pose:
+  // stock lets the open hand settle by how the controller is held. Kept until the next valid one.
+  void SetOrientation(const std::array<double, 4>& wxyz) { orientation_ = wxyz; haveOrientation_ = true; }
   // The current hand, after Update.
   Bones Current(bool withController) const;
   // Stateless: the hand once settled on this input.
@@ -34,6 +40,7 @@ class HandSkeleton {
     float thumbX = 0, thumbY = 0, thumbXV = 0, thumbYV = 0;
     float thumbLiftedFor = 0;  // s with the thumb on nothing
     float thumbRaise = 0, thumbRaiseV = 0;  // 0 on the controller .. 1 the open hand's thumb
+    float restUp = 0, restUpV = 0, restSide = 0, restSideV = 0;  // the open hand's rest pose (Update)
     int thumbState = 8;
     float fade = 1;
     float padX = 0, padY = 0, stickX = 0, stickY = 0;
@@ -46,5 +53,9 @@ class HandSkeleton {
   Bones grip_{};
   bool left_ = false;
   State state_;
+  bool indexFromTrigger_ = false;
+  std::array<double, 4> orientation_{1, 0, 0, 0};
+  bool haveOrientation_ = false;
+  Bones Rest(const State& s) const;
 };
 }

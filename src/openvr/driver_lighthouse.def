@@ -3,7 +3,7 @@
 ; HmdDriverFactory is what SteamVR loads. The hid_* entries are the hidapi this DLL is
 ; built with (statically), exported as themselves rather than through wrappers: a driver
 ; that hooks the lighthouse driver's HID access (e.g. to rewrite a headset's config as it
-; is read, #32) can find them with GetProcAddress and detour them, and every HID call this
+; is read) can find them with GetProcAddress and detour them, and every HID call this
 ; driver makes goes through them. hidapi loads hid.dll with GetProcAddress, so hooking the
 ; DLL's imports, as works on the stock driver, misses it.
 ;

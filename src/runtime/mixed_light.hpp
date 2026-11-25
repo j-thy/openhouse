@@ -150,6 +150,9 @@ struct LightModeView {
 // s since any device's last beam word that still counts as 2.0 stations lit. Past it (they've been turned
 // off), stock's choice applies again.
 constexpr double kLh2Lit = 10;
+// s dark in the mode SteamVR's database suggests before the other is tried, and how long that one is tried
+constexpr double kKnownProbe = 15;
+constexpr double kKnownOther = 10;
 MixedLightStep ChooseLightMode(const LightModeView& view);
 
 // Whether a device's LH1 frames may go into keyframes for the room map (DeviceTracker::SetLh1Keyframes). An

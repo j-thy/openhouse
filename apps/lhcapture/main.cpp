@@ -49,7 +49,7 @@ std::string Timestamp() {
   return s.str();
 }
 void Save(const fs::path& path, const Json& value) {
-  const fs::path temporary = path.string() + ".tmp";
+  const fs::path temporary = lh::platform::FsPath(lh::platform::PathUtf8(path) + ".tmp");
   std::ofstream file(temporary);
   file.exceptions(std::ios::badbit | std::ios::failbit);
   file << value.dump(2) << '\n';
@@ -244,7 +244,7 @@ int Run(int argc, char** argv) {
     Counters counters;
     lh::usb::ReportDecoder decoder(&counters);
     lh::usb::RawCaptureReader reader;
-    if (!reader.Open(output.string())) throw std::runtime_error("cannot open " + output.string());
+    if (!reader.Open(lh::platform::PathUtf8(output))) throw std::runtime_error("cannot open " + lh::platform::PathUtf8(output));
     double next = -1;
     reader.ReadAll([&](const lh::usb::EndpointInfo& e) { decoder.AddEndpoint(e); },
                    [&](const lh::usb::RawReport& r) {
@@ -277,7 +277,7 @@ int Run(int argc, char** argv) {
     seconds = total;
   }
   if (output.empty()) output = fs::path("captures") / ("session-" + Timestamp());
-  if (fs::exists(output)) throw std::runtime_error("output directory already exists (will not overwrite): " + output.string());
+  if (fs::exists(output)) throw std::runtime_error("output directory already exists (will not overwrite): " + lh::platform::PathUtf8(output));
   if (SteamVrRunning()) throw std::runtime_error("close SteamVR before recording (vrserver is running)");
   if (output.has_parent_path()) fs::create_directories(output.parent_path());
   if (!fs::create_directory(output)) throw std::runtime_error("cannot create output directory");
@@ -291,7 +291,7 @@ int Run(int argc, char** argv) {
   if (!scenario.empty()) session["scenario"] = scenario;
   if (modeTest) session["scenario"] = lh2 ? "lh2" : "mode-test";
   if (!config.empty()) session["firmware_config"] = config;
-  const fs::path cache = lh::platform::SteamConfigDirectory();
+  const fs::path cache = lh::platform::FsPath(lh::platform::SteamConfigDirectory());
   const auto database = cache / "lighthousedb.json";
   std::error_code copyError;
   if (fs::exists(database, copyError)) {
@@ -314,7 +314,7 @@ int Run(int argc, char** argv) {
   };
   Counters counters;
   lh::usb::UsbTransportOptions options;
-  options.capturePath = (path / "input.lhraw").string();
+  options.capturePath = lh::platform::PathUtf8(path / "input.lhraw");
   lh::usb::UsbTransport transport(&counters, options);
   std::cout << "Recording to " << path << "\nOpening devices..." << std::endl;
   if (!transport.Start()) {

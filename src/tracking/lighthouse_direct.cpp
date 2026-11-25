@@ -166,12 +166,12 @@ bool LighthouseDirect::ImuUpdate(const ImuSample& sample) {
     // reaching their limits: the accelerometer jumps 2-4 m/s2 from one sample to the next
     // and its average reads 11-12.5 m/s2, not 9.8. Learned from that, the IMU alignment came
     // out 17-21 deg off within 1.5 s of every reacquire, tracking reset over and over and
-    // the controller flew off between (#90). From then until 0.5 s after, gravity and the
+    // the controller flew off between. From then until 0.5 s after, gravity and the
     // IMU calibration are held and the accelerometer is trusted 100x less (from the next
     // sample), so the light carries the pose. Vibration is told from a hard swing, which
     // jumps as much per sample, by its roughness: the second difference over the first
     // (both averaged over ~0.25 s) is ~1.9 (the reading flips nearly every sample), a
-    // swing's or a stomp's 0.4-1.0. (#90 recordings, two controllers: resets 21/8 and
+    // swing's or a stomp's 0.4-1.0. (two controllers' recordings: resets 21/8 and
     // 17 -> 0-1, steps > 5 cm 387/246 and 93 -> 1-43. Held as violent motion instead,
     // frames rejected too: a vibrating pickup in vrchat-01 flew off 4 m. On the jumps
     // alone, without roughness, hard swings jumped twice as often.)
@@ -205,6 +205,21 @@ bool LighthouseDirect::ImuUpdate(const ImuSample& sample) {
   const bool updated = filter_.Update(residuals, R, Eigen::Map<Vec>(measurements.data(), m));
   filter_.imuUpdate = false;
   if (!updated) return false;
+  // Not stock: blind, the velocity is capped and fades. An IMU clipped by a hard swing (a Vive
+  // wand at 2000 deg/s and 8 g in 11 % of its samples) leaves the velocity at 10-17 m/s with
+  // no light to correct it, and coasting on that threw the device 2-7 m off, out of bounds,
+  // within 0.2-0.5 s. A hand isn't that fast for that long (Beat Saber swings peak at 6-7
+  // m/s). From 0.1 s without light (shorter gaps are normal in fast play: capping them made
+  // the snap back worse), |v| <= 6 m/s, and it and the acceleration fade with 0.2 s.
+  // (wand: fly-aways 3 -> 0; fastmotion*/testswing/spin-01/ms4-01: fly-aways 28 -> 20,
+  // jumps > 5 cm 1197 -> 984; fastmotionindex controllers' jumps 296 -> 262; vrchat-01
+  // unchanged.)
+  if (swing_ && sample.time - lastOpticalTime_ > kBlindAfter && dt > 0) {
+    double* v = filter_.x + 3;
+    const double speed = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    const double k = (speed > kBlindMaxSpeed ? kBlindMaxSpeed / speed : 1.0) * std::exp(-dt / kBlindFade);
+    for (int i = 3; i < 9; ++i) filter_.x[i] *= k;   // velocity and acceleration
+  }
   time_ = sample.time;
   return true;
 }

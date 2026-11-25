@@ -23,9 +23,41 @@
 #endif
 
 namespace lh::platform {
+#ifdef _WIN32
+// UTF-16 <-> UTF-8: every path openhouse keeps as a std::string is UTF-8.
+inline std::string ToUtf8(const std::wstring& wide) {
+  if (wide.empty()) return {};
+  const int n = WideCharToMultiByte(CP_UTF8, 0, wide.data(), int(wide.size()), nullptr, 0, nullptr, nullptr);
+  std::string out(n > 0 ? n : 0, '\0');
+  if (n > 0) WideCharToMultiByte(CP_UTF8, 0, wide.data(), int(wide.size()), out.data(), n, nullptr, nullptr);
+  return out;
+}
+#endif
+// A UTF-8 path string as a filesystem path. Open files through this, not a std::string:
+// on Windows a std::string open goes through the ANSI code page, which can't name a folder
+// like C:\Users\Mattéo.
+inline std::filesystem::path FsPath(const std::string& utf8) {
+  return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(utf8.data()),
+                                             reinterpret_cast<const char8_t*>(utf8.data()) + utf8.size()));
+}
+// A filesystem path as UTF-8. Never path.string(): with MinGW's libstdc++ that converts through
+// the C locale and throws on any non-ASCII character (a user folder like C:\Users\かもりー).
+inline std::string PathUtf8(const std::filesystem::path& path) {
+  const std::u8string u = path.u8string();
+  return std::string(reinterpret_cast<const char*>(u.data()), u.size());
+}
+// An environment variable, UTF-8. On Windows getenv gives the ANSI code page: a user name
+// like "Mattéo" came out as bytes no std::filesystem::path could convert, and the throw
+// took vrserver down at start.
 inline std::string Env(const char* key) {
+#ifdef _WIN32
+  std::wstring wideKey(key, key + std::char_traits<char>::length(key));
+  if (const wchar_t* value = _wgetenv(wideKey.c_str())) return ToUtf8(value);
+  return "";
+#else
   const char* value = std::getenv(key);
   return value ? value : "";
+#endif
 }
 inline unsigned long ProcessId() {
 #ifdef _WIN32
@@ -58,12 +90,12 @@ inline std::string SteamRoot() {
   DWORD bytes = sizeof(value);
   if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath",
                    RRF_RT_REG_SZ, nullptr, value, &bytes) == ERROR_SUCCESS && *value)
-    return std::filesystem::path(value).string();
+    return ToUtf8(value);
   auto dir = Env("ProgramFiles(x86)");
   return (dir.empty() ? "C:/Program Files (x86)" : dir) + "/Steam";
 #else
   const auto modern = Home() + "/.local/share/Steam";
-  if (std::filesystem::exists(modern)) return modern;
+  if (std::filesystem::exists(FsPath(modern))) return modern;
   return Home() + "/.steam/steam";
 #endif
 }
@@ -114,11 +146,11 @@ inline std::vector<std::string> JsonStringList(const std::string& text, const st
   return out;
 }
 inline std::string SteamVRFromOpenVRPaths() {
-  std::ifstream in(OpenVRPathsFile(), std::ios::binary);
+  std::ifstream in(FsPath(OpenVRPathsFile()), std::ios::binary);
   const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   std::error_code ec;
   for (const auto& dir : JsonStringList(text, "runtime"))
-    if (std::filesystem::exists(std::filesystem::path(dir) / "drivers/lighthouse", ec)) return dir;
+    if (std::filesystem::exists(FsPath(dir) / "drivers/lighthouse", ec)) return dir;
   return {};
 }
 inline std::string SteamVRDirectory() {
@@ -134,7 +166,7 @@ inline std::string SteamVRDirectory() {
     if (n && n < std::size(buffer)) {
       auto dir = std::filesystem::path(buffer).parent_path();
       for (int i = 0; i < 4; ++i) dir = dir.parent_path();
-      if (std::filesystem::exists(dir / "drivers/indexcontroller/resources")) return dir.string();
+      if (std::filesystem::exists(dir / "drivers/indexcontroller/resources")) return PathUtf8(dir);
     }
   }
 #endif
@@ -145,7 +177,7 @@ inline std::string SteamVRDirectory() {
 inline void ReplaceFile(const std::filesystem::path& source, const std::filesystem::path& destination) {
 #ifdef _WIN32
   if (!MoveFileExW(source.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-    throw std::system_error(int(GetLastError()), std::system_category(), "replacing " + destination.string());
+    throw std::system_error(int(GetLastError()), std::system_category(), "replacing " + PathUtf8(destination));
 #else
   std::filesystem::rename(source, destination);
 #endif

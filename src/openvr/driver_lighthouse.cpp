@@ -30,13 +30,18 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <map>
+#include <optional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "device_abi.hpp"
 #include "pairing_mailbox.hpp"
 #include "stock_hmd.hpp"
 #include "watchdog.hpp"
@@ -56,7 +61,9 @@ constexpr const char* kStockFile = "driver_lighthouse.so.stock";
 #include "steam_rooms.hpp"
 #include "room_publisher.hpp"
 #include "telemetry_server.hpp"
+#include "tracker_names.hpp"
 #include "lh/log_level.hpp"
+#include "lh/build_time.h"
 #include "lh/telemetry.hpp"
 #include "lh/version.hpp"
 #include "lh/bug_report.hpp"
@@ -66,6 +73,7 @@ constexpr const char* kStockFile = "driver_lighthouse.so.stock";
 #include "platform/platform.hpp"
 #include <ctime>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <sstream>
 #ifdef _WIN32
@@ -77,9 +85,6 @@ namespace {
 
 using namespace vr;
 
-// "Hide lost devices" (SteamVR's settings page, or settings.json "hideLostDevices"):
-// set by ApplyTuning, read by Device::Update.
-std::atomic<bool> g_hideLost{false};
 
 double SteadyNow() {
   return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -149,8 +154,52 @@ Recorder g_recorder;
 lh::openvr::TelemetryServer g_telemetry;
 const lh::LogLevel g_logLevel = lh::MinimumLogLevelFromEnvironment();
 
+// Always on, as SteamVR's vrserver.txt: <data dir>/logs/openhouse.txt, the run before as
+// openhouse.previous.txt. Info and up (or what LH_LOG_LEVEL asks for, if lower), whatever the host keeps.
+class LogFile {
+ public:
+  void Line(lh::LogLevel level, const std::string& text, const std::string& serial) {
+    std::lock_guard lock(mutex_);
+    if (!tried_) Open();
+    if (!out_) return;
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    const int ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char stamp[32];
+    std::strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M:%S", &tm);
+    char msPart[8];
+    std::snprintf(msPart, sizeof msPart, ".%03d", ms);
+    out_ << stamp << msPart << " [" << lh::LogLevelName(level) << "] " << (serial.empty() ? "" : serial + ": ") << text << '\n';
+    out_.flush();   // a crashed vrserver keeps every line
+    if (++lines_ % 1000 == 0 && out_.tellp() > kMaxBytes) { out_.close(); Open(); }   // a run that logs without end
+  }
+ private:
+  static constexpr std::streamoff kMaxBytes = 64ll << 20;
+  void Open() {
+    tried_ = true;
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path dir = fs::u8path(lh::platform::DataDirectory()) / "logs";
+    fs::create_directories(dir, ec);
+    fs::rename(dir / "openhouse.txt", dir / "openhouse.previous.txt", ec);
+    out_.open(dir / "openhouse.txt", std::ios::out | std::ios::trunc);
+  }
+  std::mutex mutex_;
+  std::ofstream out_;
+  bool tried_ = false;
+  uint64_t lines_ = 0;
+};
+LogFile g_logFile;
+
 void Log(lh::LogLevel level, const std::string& text, const std::string& serial = {}, double time = SteadyNow()) {
   g_telemetry.Log(time, level, serial, text);
+  if (level >= std::min(g_logLevel, lh::LogLevel::Info)) g_logFile.Line(level, text, serial);
   if (level >= g_logLevel && VRDriverLog())
     VRDriverLog()->Log(("lh: [" + std::string(lh::LogLevelName(level)) + "] " + text + "\n").c_str());
 }
@@ -214,9 +263,9 @@ bool StockHmdUnwanted(std::string* why) {
 
 std::string HostName() {
 #ifdef _WIN32
-  char path[MAX_PATH]{};
-  GetModuleFileNameA(nullptr, path, MAX_PATH);
-  return std::filesystem::path(path).stem().string();
+  wchar_t path[MAX_PATH]{};
+  GetModuleFileNameW(nullptr, path, MAX_PATH);
+  return lh::platform::PathUtf8(std::filesystem::path(path).stem());
 #else
   std::ifstream comm("/proc/self/comm");
   std::string name;
@@ -255,6 +304,11 @@ struct DeviceStatic {
   lh::ControllerType controllerType = lh::ControllerType::Index;
   bool lh2 = false;         // base stations: a 2.0 one
   std::string resourceRoot, inputProfile, registeredType;  // trackers: the config's own (lh::DeviceInfo)
+  // device_class "null": tracked as ever, but registered as TrackedDeviceClass_Invalid, so SteamVR and
+  // apps don't list it, while TrackingOverrides can still use it (e.g. a tracker on the head standing
+  // in for the headset). As the stock driver (0x2e8120): a class it doesn't know is Invalid.
+  bool hidden = false;
+  bool tundraTracker = false;
 };
 
 class Device : public ITrackedDeviceServerDriver {
@@ -268,20 +322,24 @@ class Device : public ITrackedDeviceServerDriver {
     pose_.deviceIsConnected = true;
   }
 
+  // What the host is given for this device: GetPose in the host's order (device_abi.hpp).
+  ITrackedDeviceServerDriver* ForHost() { return forHost_.Host(); }
+
   EVRInitError Activate(uint32_t objectId) override {
     active_ = false;
     lastInputTime_ = lastPoseTime_ = -1;
+    basePublished_ = false;
     skeletonInput_ = {};
     lastSkeletonSent_ = -1e300;
-    battery_ = -1; universe_ = 0; hadInput_ = false;
+    battery_ = -1; universe_ = 0; hadInput_ = false; autoHand_ = 0;
     std::fill(std::begin(sent_), std::end(sent_), false);
     std::fill(std::begin(handles_), std::end(handles_), k_ulInvalidInputComponentHandle);
-    haptic_ = skeletonHandle_ = k_ulInvalidInputComponentHandle;
+    haptic_ = skeletonHandle_ = skeletonOtherHandle_ = k_ulInvalidInputComponentHandle;
     id_ = objectId;
     container_ = VRProperties()->TrackedDeviceToPropertyContainer(objectId);
     SetProperties();
     if (info_.role == lh::DeviceRole::Controller) CreateInputs();
-    else if (info_.role == lh::DeviceRole::Tracker && HtcTracker()) CreateTrackerInputs();
+    else if (info_.role == lh::DeviceRole::Tracker && (HtcTracker() || info_.tundraTracker)) CreateTrackerInputs();
     active_ = true;
     return VRInitError_None;
   }
@@ -290,11 +348,13 @@ class Device : public ITrackedDeviceServerDriver {
     id_ = k_unTrackedDeviceIndexInvalid;
   }
   // A device the host activated through another driver (a headset from the stock driver,
-  // stock_hmd.hpp): we only publish its pose; its properties are that driver's.
-  void AttachExternal(uint32_t objectId, const std::atomic<bool>* alive) {
+  // stock_hmd.hpp): we only publish its pose; its properties are that driver's. published:
+  // also handed every pose we publish for it (on our thread, after poseMutex_ is released).
+  void AttachExternal(uint32_t objectId, const std::atomic<bool>* alive, lh::openvr::PublishedPose* published = nullptr) {
     id_ = objectId;
     container_ = VRProperties()->TrackedDeviceToPropertyContainer(objectId);
     externalAlive_ = alive;
+    published_ = published;
     active_ = true;
   }
   // SteamVR's idle power-off (power/turnOffControllersTimeout) calls this; the stock
@@ -317,6 +377,21 @@ class Device : public ITrackedDeviceServerDriver {
   bool IsHmd() const { return info_.role == lh::DeviceRole::Hmd; }
   // "left_hand" / "right_hand" for a controller, else "".
   std::string Hand() const { return info_.role == lh::DeviceRole::Controller ? info_.controllerRole : std::string(); }
+  // A wand with no hand set: its hand follows where it is, as SteamVR's own driver does.
+  bool AutoHandWand() const {
+    return info_.role == lh::DeviceRole::Controller && info_.controllerType == lh::ControllerType::ViveWand &&
+           info_.controllerRole.empty();
+  }
+  // 0 none yet, else TrackedControllerRole_LeftHand / _RightHand.
+  int AutoHand() const { return autoHand_; }
+  void SetAutoHand(int role) {
+    if (role == autoHand_ || !Active()) return;
+    autoHand_ = role;
+    VRProperties()->SetInt32Property(container_, Prop_ControllerRoleHint_Int32,
+                                     role ? role : int(TrackedControllerRole_Invalid));
+    VRServerDriverHost()->VendorSpecificEvent(id_, VREvent_TrackedDeviceRoleChanged, {}, 0);
+    if (role) Log(info_.serial + ": " + (role == TrackedControllerRole_LeftHand ? "left" : "right") + " hand");
+  }
   std::string StringProperty(ETrackedDeviceProperty prop) const {
     if (!Active()) return {};
     char value[256] = {};
@@ -365,7 +440,7 @@ class Device : public ITrackedDeviceServerDriver {
     VRProperties()->SetUint64Property(container_, Prop_CurrentUniverseId_Uint64, universe);
   }
   // The receiver it's connected through, as the stock driver publishes it. Tools that
-  // power devices off (OyasumiVR, #37) need it: they run lighthouse_console against it.
+  // power devices off (OyasumiVR) need it: they run lighthouse_console against it.
   void SetDongle(const std::string& receiver) {
     if (!active_ || receiver == dongle_) return;
     dongle_ = receiver;
@@ -404,25 +479,21 @@ class Device : public ITrackedDeviceServerDriver {
     if (pose.valid) {
       held_ = p;
       haveHeld_ = true;
-    } else if (p.deviceIsConnected && g_hideLost && !IsHmd()) {
-      // "Hide lost devices" (off by default): reported lost, as SteamVR's own driver does, so
-      // the host hides it until light finds it again. The headset is still held: a lost
-      // headset would show SteamVR's grey tracking-lost screen.
-      p.result = TrackingResult_Running_OutOfRange;
-      p.poseIsValid = false;
-      p.poseTimeOffset = 0;
     } else if (haveHeld_ && p.deviceIsConnected) {
-      // Lost while on: held where it was last seen, as the stock driver does, until
-      // light finds it again. liblh's lost record is an identity pose, which a host
-      // shows at the origin (Monado: any invalid pose is the identity).
+      // Lost: held where it was last seen until light finds it again, reported out of range.
+      // liblh's lost record is an identity pose, which a host would show at the origin.
+      // SteamVR hides a controller or tracker whose pose is invalid, as with its own driver;
+      // Monado and WiVRn show an invalid pose at the origin instead, so there it stays valid.
+      // The headset is always held: SteamVR shows its grey tracking-lost screen otherwise.
+      static const bool hostHides = HostName().rfind("vrserver", 0) == 0;
       p = held_;
       for (int i = 0; i < 3; ++i) p.vecVelocity[i] = p.vecAngularVelocity[i] = p.vecAcceleration[i] = p.vecAngularAcceleration[i] = 0;
       p.qWorldFromDriverRotation = {rawRotation.w(), rawRotation.x(), rawRotation.y(), rawRotation.z()};
       for (int i = 0; i < 3; ++i) p.vecWorldFromDriverTranslation[i] = rawFromWorld_.translation()[i];
       p.poseTimeOffset = 0;
       p.result = TrackingResult_Running_OutOfRange;
-      p.poseIsValid = true;
-      held = true;
+      p.poseIsValid = IsHmd() || !hostHides;
+      held = p.poseIsValid;
     } else if (!p.deviceIsConnected) {
       haveHeld_ = false;  // switched off: it comes back wherever it is
     }
@@ -440,6 +511,7 @@ class Device : public ITrackedDeviceServerDriver {
         pose_ = p;
       }
       VRServerDriverHost()->TrackedDevicePoseUpdated(id_, p, sizeof(p));
+      if (published_) published_->Publish(p);
       Record(p, now, held);
     }
     if (u.batteryPercent && (*u.batteryPercent != battery_ || u.charging != charging_)) {
@@ -448,7 +520,7 @@ class Device : public ITrackedDeviceServerDriver {
       VRProperties()->SetFloatProperty(container_, Prop_DeviceBatteryPercentage_Float, float(battery_) / 100.0f);
       VRProperties()->SetBoolProperty(container_, Prop_DeviceIsCharging_Bool, charging_);
     }
-    if (info_.role == lh::DeviceRole::Controller || (info_.role == lh::DeviceRole::Tracker && HtcTracker())) {
+    if (info_.role == lh::DeviceRole::Controller || u.input || hadInput_) {
       if (u.input && p.deviceIsConnected) { UpdateInputs(*u.input, now); hadInput_ = true; }
       else if (hadInput_) { lh::ControllerInput neutral; neutral.hostTime = now; UpdateInputs(neutral, now); hadInput_ = false; }
       if (info_.role == lh::DeviceRole::Controller && now - lastSkeletonSent_ >= kSkeletonInterval) SendSkeleton(now);
@@ -472,7 +544,18 @@ class Device : public ITrackedDeviceServerDriver {
                                                                  : TrackingResult_Calibrating_InProgress;
     p.poseIsValid = settled && b.seen;
     p.deviceIsConnected = b.seen;
-    // Room orientation/alignment can change even when the base position doesn't.
+    // Only when something changed (its place, the room frame, its state): apps that watch base
+    // stations count every update as a move.
+    const auto same = [](const DriverPose_t& x, const DriverPose_t& y) {
+      return x.result == y.result && x.poseIsValid == y.poseIsValid && x.deviceIsConnected == y.deviceIsConnected &&
+             !std::memcmp(&x.qRotation, &y.qRotation, sizeof x.qRotation) &&
+             !std::memcmp(x.vecPosition, y.vecPosition, sizeof x.vecPosition) &&
+             !std::memcmp(&x.qWorldFromDriverRotation, &y.qWorldFromDriverRotation, sizeof x.qWorldFromDriverRotation) &&
+             !std::memcmp(x.vecWorldFromDriverTranslation, y.vecWorldFromDriverTranslation, sizeof x.vecWorldFromDriverTranslation);
+    };
+    if (basePublished_ && same(p, lastBase_)) return;
+    basePublished_ = true;
+    lastBase_ = p;
     {
       std::lock_guard lock(poseMutex_);
       pose_ = p;
@@ -481,6 +564,8 @@ class Device : public ITrackedDeviceServerDriver {
   }
 
  private:
+  lh::openvr::DeviceForHost forHost_{this};
+
   // At most 100 Hz per device, but every change of state.
   void Record(const DriverPose_t& p, double now, bool held) {
     if (!g_recorder.On()) return;
@@ -507,6 +592,8 @@ class Device : public ITrackedDeviceServerDriver {
     const PropertyContainerHandle_t c = container_;
     props->SetStringProperty(c, Prop_TrackingSystemName_String, "lighthouse");
     props->SetStringProperty(c, Prop_SerialNumber_String, info_.serial.c_str());
+    // Tells apps it's openhouse, not SteamVR's own driver (same tracking system name).
+    props->SetStringProperty(c, Prop_DriverVersion_String, (std::string("openhouse ") + lh::kVersion).c_str());
     props->SetBoolProperty(c, Prop_WillDriftInYaw_Bool, false);
     props->SetBoolProperty(c, Prop_DeviceIsWireless_Bool, info_.role != lh::DeviceRole::BaseStation);
     props->SetBoolProperty(c, Prop_HasDisplayComponent_Bool, false);
@@ -639,8 +726,8 @@ class Device : public ITrackedDeviceServerDriver {
       default: {  // trackers (HTC's: inputs from CreateTrackerInputs)
         // As the stock driver (0x1cf860, 0x1d69f0): an HTC tracker gets HTC's profile and
         // type, and "vr_tracker_vive_1_0" becomes {htc}vr_tracker_vive_3_0 on a 3.0. Any
-        // other maker's (Tundra Labs) keeps its own resource root, profile and icons
-        // (#29, #40): they were all HTC's.
+        // other maker's (Tundra Labs) keeps its own resource root, profile and icons, instead
+        // of HTC's.
         const bool htc = HtcTracker();
         const std::string root = htc || info_.resourceRoot.empty() ? "htc" : info_.resourceRoot;
         std::string renderModel = info_.renderModel.empty() ? "{htc}vr_tracker_vive_1_0" : info_.renderModel;
@@ -648,7 +735,12 @@ class Device : public ITrackedDeviceServerDriver {
         if (htc && EqualsNoCase(renderModel, "{htc}vr_tracker_vive_1_0") && info_.model.rfind("VIVE Tracker 3.0", 0) == 0)
           renderModel = "{htc}vr_tracker_vive_3_0";
         const std::string profile = htc || info_.inputProfile.empty() ? "{htc}/input/vive_tracker_profile.json" : info_.inputProfile;
-        const std::string registered = htc || info_.registeredType.empty() ? "htc/vive_tracker" + info_.serial : info_.registeredType;
+        // The device's path in SteamVR ("/devices/<this>"), which saved tracker roles and
+        // TrackingOverrides go by: as the stock driver names it, HTC's "htc/vive_tracker<serial>",
+        // any other maker's its config's type or else "lighthouse/<serial>".
+        const std::string registered = htc ? "htc/vive_tracker" + info_.serial
+                                           : !info_.registeredType.empty() ? info_.registeredType
+                                                                           : "lighthouse/" + info_.serial;
         props->SetStringProperty(c, Prop_ManufacturerName_String, info_.manufacturer.empty() ? "HTC" : info_.manufacturer.c_str());
         props->SetStringProperty(c, Prop_ModelNumber_String, info_.model.empty() ? "VIVE Tracker" : info_.model.c_str());
         props->SetStringProperty(c, Prop_ResourceRoot_String, root.c_str());
@@ -657,7 +749,7 @@ class Device : public ITrackedDeviceServerDriver {
         props->SetStringProperty(c, Prop_RenderModelName_String, renderModel.c_str());
         props->SetStringProperty(c, Prop_RegisteredDeviceType_String, registered.c_str());
         props->SetInt32Property(c, Prop_ControllerRoleHint_Int32, TrackedControllerRole_OptOut);
-        props->SetInt32Property(c, Prop_DeviceClass_Int32, TrackedDeviceClass_GenericTracker);
+        props->SetInt32Property(c, Prop_DeviceClass_Int32, info_.hidden ? TrackedDeviceClass_Invalid : TrackedDeviceClass_GenericTracker);
         props->SetBoolProperty(c, Prop_DeviceProvidesBatteryStatus_Bool, true);
         props->SetFloatProperty(c, Prop_DeviceBatteryPercentage_Float, 1.0f);
         props->SetBoolProperty(c, Prop_DeviceIsCharging_Bool, false);
@@ -700,6 +792,7 @@ class Device : public ITrackedDeviceServerDriver {
       created(i, path, in->CreateBooleanComponent(c, path, &handles_[i]));
     };
     b(SystemClick, "/input/power/click");
+    if (info_.tundraTracker) return;  // built-in button only
     b(MenuClick, "/input/application_menu/click");
     b(GripClick, "/input/grip/click");
     b(TriggerClick, "/input/trigger/click");
@@ -730,8 +823,9 @@ class Device : public ITrackedDeviceServerDriver {
       created(i, path, in->CreateScalarComponent(c, path, &handles_[i], VRScalarType_Absolute, VRScalarUnits_NormalizedTwoSided));
     };
     if (info_.controllerType == lh::ControllerType::ViveWand) {
-      // The wand's components, as vive_controller_profile.json names them. No skeleton:
-      // SteamVR estimates the hand from the buttons.
+      // The wand's components, as vive_controller_profile.json names them, and a hand
+      // estimated from the buttons, as the stock driver gives it: apps that animate the
+      // fingers from the skeleton have nothing to go by without it.
       b(SystemClick, "/input/system/click");
       b(MenuClick, "/input/application_menu/click");
       b(GripClick, "/input/grip/click");
@@ -742,10 +836,16 @@ class Device : public ITrackedDeviceServerDriver {
       s2(PadX, "/input/trackpad/x");
       s2(PadY, "/input/trackpad/y");
       in->CreateHapticComponent(c, "/output/haptic", &haptic_);
+      CreateSkeleton();
       return;
     }
-    if (info_.controllerType == lh::ControllerType::Mapped) CreateMappedInputs();
-    else CreateIndexInputs(b, s1, s2);
+    // A mapped controller (FlipVR) gets no skeleton, as with the stock driver: it has no finger
+    // sensors, and apps that see one take it over their own hand poses (VRChat's gestures).
+    if (info_.controllerType == lh::ControllerType::Mapped) {
+      CreateMappedInputs();
+      return;
+    }
+    CreateIndexInputs(b, s1, s2);
     CreateSkeleton();
   }
 
@@ -833,22 +933,30 @@ class Device : public ITrackedDeviceServerDriver {
       for (const char* root : {"/.local/share/Steam/steamapps/common/SteamVR", "/.steam/steam/steamapps/common/SteamVR"})
         paths.emplace_back(std::string(home) + root + "/drivers/indexcontroller/resources/anims/vr_glove_right_poses.glb");
     }
+    const bool wand = info_.controllerType == lh::ControllerType::ViveWand;
     const bool left = info_.controllerRole == "left_hand";
+    // A wand's hand is known only once SteamVR picks one (no role hint): both then.
+    const bool both = wand && info_.controllerRole != "left_hand" && info_.controllerRole != "right_hand";
     std::string error;
-    bool loaded = false;
-    for (const auto& path : paths) if (skeleton_.Load(path, left, &error)) { loaded = true; break; }
-    if (loaded && !error.empty()) Log("skeleton: " + error);
-    if (loaded) {
-      const auto& bones = skeleton_.GripLimit();
+    auto create = [&](lh::openvr::HandSkeleton& skeleton, bool isLeft, VRInputComponentHandle_t* handle) {
+      bool loaded = false;
+      for (const auto& path : paths) if (skeleton.Load(path, isLeft, &error)) { loaded = true; break; }
+      if (!loaded) { Log("skeleton unavailable: " + error); return; }
+      if (!error.empty()) Log("skeleton: " + error);
+      skeleton.SetIndexFromTrigger(wand);
+      const auto& bones = skeleton.GripLimit();
       // Partial, as the stock Index driver reports it: each finger follows its own
       // capacitive sensor. Monado's steamvr_lh only exposes a skeleton that isn't
       // Estimated as (conforming) hand tracking; without it OpenXR apps and xrizer
-      // fall back to their own estimate, middle, ring and pinky as one.
-      const auto result = VRDriverInput()->CreateSkeletonComponent(c, left ? "/input/skeleton/left" : "/input/skeleton/right",
-          left ? "/skeleton/hand/left" : "/skeleton/hand/right", "/pose/raw", VRSkeletalTracking_Partial,
-          bones.data(), uint32_t(bones.size()), &skeletonHandle_);
-      if (result != VRInputError_None) { skeletonHandle_ = 0; Log("skeleton creation failed: " + std::to_string(result)); }
-    } else Log("skeleton unavailable: " + error);
+      // fall back to their own estimate, middle, ring and pinky as one. A wand has no
+      // finger sensors: Estimated, as the stock driver says.
+      const auto result = VRDriverInput()->CreateSkeletonComponent(c, isLeft ? "/input/skeleton/left" : "/input/skeleton/right",
+          isLeft ? "/skeleton/hand/left" : "/skeleton/hand/right", "/pose/raw",
+          wand ? VRSkeletalTracking_Estimated : VRSkeletalTracking_Partial, bones.data(), uint32_t(bones.size()), handle);
+      if (result != VRInputError_None) { *handle = 0; Log("skeleton creation failed: " + std::to_string(result)); }
+    };
+    create(skeleton_, both ? false : left, &skeletonHandle_);
+    if (both) create(skeletonOther_, true, &skeletonOtherHandle_);
   }
 
   // Monado's steamvr_lh stamps each skeleton update with the controller's latest pose
@@ -858,15 +966,39 @@ class Device : public ITrackedDeviceServerDriver {
   // (WayVR's clock) was fine: so the skeleton also goes out with the poses.
   // The hand's springs and fades advance here, on the host clock, with the latest
   // input: stepped only when an input report came, they moved in jumps.
+  // The controller's orientation as apps get it from the last pose sent: world from driver, driver from
+  // IMU, IMU from head (as stock gives its hand).
+  std::optional<std::array<double, 4>> HeadOrientation() {
+    DriverPose_t p;
+    { std::lock_guard lock(poseMutex_); p = pose_; }
+    if (!p.poseIsValid) return std::nullopt;
+    const auto q = [](const HmdQuaternion_t& v) { return Eigen::Quaterniond(v.w, v.x, v.y, v.z); };
+    const Eigen::Quaterniond h = q(p.qWorldFromDriverRotation) * q(p.qRotation) * q(p.qDriverFromHeadRotation);
+    return std::array<double, 4>{h.w(), h.x(), h.y(), h.z()};
+  }
+
   void SendSkeleton(double now) {
-    if (!skeletonHandle_) return;
-    skeleton_.Update(skeletonInput_, lastSkeletonSent_ < -1e299 ? 0 : now - lastSkeletonSent_);
+    if (!skeletonHandle_ && !skeletonOtherHandle_) return;
+    const double dt = lastSkeletonSent_ < -1e299 ? 0 : now - lastSkeletonSent_;
     lastSkeletonSent_ = now;
-    for (bool withController : {true, false}) {
-      const auto bones = skeleton_.Current(withController);
-      VRDriverInput()->UpdateSkeletonComponent(
-          skeletonHandle_, withController ? VRSkeletalMotionRange_WithController : VRSkeletalMotionRange_WithoutController,
-          bones.data(), uint32_t(bones.size()));
+    // A wand's buttons as the fingers they stand for: trigger -> index, grip -> the other three.
+    lh::ControllerInput in = skeletonInput_;
+    if (info_.controllerType == lh::ControllerType::ViveWand) {
+      in.fingerIndex = float(in.trigger);
+      in.triggerTouch = in.trigger > 0.05 || in.triggerClick;
+      in.fingerMiddle = in.fingerRing = in.fingerPinky = in.gripClick ? 1.f : 0.f;
+      in.gripForce = in.gripClick ? 0.3f : 0.f;
+    }
+    for (auto [skeleton, handle] : {std::pair{&skeleton_, skeletonHandle_}, std::pair{&skeletonOther_, skeletonOtherHandle_}}) {
+      if (!handle) continue;
+      if (const auto q = HeadOrientation()) skeleton->SetOrientation(*q);
+      skeleton->Update(in, dt);
+      for (bool withController : {true, false}) {
+        const auto bones = skeleton->Current(withController);
+        VRDriverInput()->UpdateSkeletonComponent(
+            handle, withController ? VRSkeletalMotionRange_WithController : VRSkeletalMotionRange_WithoutController,
+            bones.data(), uint32_t(bones.size()));
+      }
     }
   }
 
@@ -884,7 +1016,7 @@ class Device : public ITrackedDeviceServerDriver {
       // Used after a minute of rest: this one is in the hand now (the other on a hip,
       // a shelf): it becomes the primary for its hand.
       const auto t = std::chrono::steady_clock::now();
-      if (t - lastUse_ > std::chrono::seconds(60))
+      if (t - lastUse_ > std::chrono::seconds(60) && !autoHand_)
         VRProperties()->SetInt32Property(container_, Prop_ControllerHandSelectionPriority_Int32, NextHandPriority());
       lastUse_ = t;
     }
@@ -900,7 +1032,7 @@ class Device : public ITrackedDeviceServerDriver {
         double(s.trackpadTouch), s.trackpadX, s.trackpadY, s.trackpadForce, s.fingerIndex, s.fingerMiddle,
         s.fingerRing, s.fingerPinky, double(s.trackpadClick), double(s.gripClick), double(s.menuClick)};
     auto* in = ComponentInput();
-    if (skeletonHandle_) {
+    if (skeletonHandle_ || skeletonOtherHandle_) {
       skeletonInput_ = s;
       SendSkeleton(now);
     }
@@ -936,12 +1068,16 @@ class Device : public ITrackedDeviceServerDriver {
 
   Eigen::Isometry3d rawFromWorld_ = Eigen::Isometry3d::Identity();
   Eigen::Isometry3d publishedRaw_ = Eigen::Isometry3d::Identity();
+  DriverPose_t lastBase_{};      // base stations: the pose last published
+  bool basePublished_ = false;
   bool hadInput_ = false;
   DeviceStatic info_;
   std::atomic<bool> active_{false};
   const std::atomic<bool>* externalAlive_ = nullptr;  // AttachExternal: the host still has it
+  lh::openvr::PublishedPose* published_ = nullptr;  // AttachExternal: handed every pose we publish
   std::atomic<bool> powerOffRequested_{false};
   std::chrono::steady_clock::time_point lastUse_{};
+  int autoHand_ = 0;
   static int32_t NextHandPriority() {
     static std::atomic<int32_t> next{1000};
     return ++next;
@@ -985,17 +1121,33 @@ class Device : public ITrackedDeviceServerDriver {
   static constexpr double kSkeletonInterval = 0.005;  // s: at most 200 Hz, with the poses
   lh::openvr::HandSkeleton skeleton_;
   VRInputComponentHandle_t skeletonHandle_ = 0;
+  // A wand with no hand yet: the other hand's skeleton too (SteamVR uses the one for the hand it takes).
+  lh::openvr::HandSkeleton skeletonOther_;
+  VRInputComponentHandle_t skeletonOtherHandle_ = 0;
 };
 
 class Provider : public IServerTrackedDeviceProvider {
  public:
+  // A throw escaping Init ends vrserver (Error 301, then safe mode blocks every driver):
+  // it's logged and the driver doesn't load instead.
   EVRInitError Init(IVRDriverContext* context) override {
+    try {
+      return InitImpl(context);
+    } catch (const std::exception& e) {
+      Log(std::string("openhouse failed to start: ") + e.what());
+    } catch (...) {
+      Log("openhouse failed to start");
+    }
+    session_.reset();
+    return VRInitError_Init_HmdNotFound;
+  }
+  EVRInitError InitImpl(IVRDriverContext* context) {
     VR_INIT_SERVER_DRIVER_CONTEXT(context);
     context_ = context;
     lh::SessionOptions options;
     if (const char* replay = std::getenv("LH_REPLAY")) options.replayPath = replay;
     if (const char* room = std::getenv("LH_ROOM_MAP")) options.roomMapPath = room;
-    // SteamVR's rooms (steam_rooms.hpp, #82): under SteamVR, by default, SteamVR's rooms are
+    // SteamVR's rooms (steam_rooms.hpp): under SteamVR, by default, SteamVR's rooms are
     // imported, a room SteamVR already has Room Setup for uses that universe and its frame,
     // and our other rooms are written into lighthousedb.json as universes of their own.
     // Off ("Use SteamVR's rooms" on the settings page, LH_HOST_FRAME=openhouse, other
@@ -1006,10 +1158,11 @@ class Provider : public IServerTrackedDeviceProvider {
     const std::string hostFrameMode = hostFrame ? hostFrame : "";
     steamFrame_ = hostFrameMode == "steamvr";
     steamRooms_ = false;
-    if (steamvrHost && hostFrameMode.empty() && VRSettings()) {
-      EVRSettingsError e = VRSettingsError_None;
-      const bool on = VRSettings()->GetBool("driver_openhouse", "useSteamVRRooms", &e);
-      steamRooms_ = e != VRSettingsError_None || on;  // no value yet: on
+    if (steamvrHost) MigrateSteamVRSettings();  // older versions' SteamVR settings page
+    if (steamvrHost && hostFrameMode.empty()) {
+      const nlohmann::json settings = ReadSettings();
+      const auto on = settings.find("useSteamVRRooms");
+      steamRooms_ = on == settings.end() || !on->is_boolean() || on->get<bool>();  // no value: on
     }
     if (const char* force = std::getenv("LH_STEAMVR_ROOMS"); force && *force && hostFrameMode.empty())
       steamRooms_ = std::string(force) == "1";  // any host (tests)
@@ -1061,6 +1214,7 @@ class Provider : public IServerTrackedDeviceProvider {
       std::string chaperone = lh::platform::SteamRoot() + "/config/chaperone_info.vrchap";
       if (const char* p = std::getenv("LH_CHAPERONE")) chaperone = p;
       const auto setUp = lh::openvr::ChaperoneUniverses(chaperone);
+      setUpUniverses_ = setUp;
       // SteamVR's universes (an imported room stays in its own), and those with Room Setup.
       if (!text.empty()) {
         if (!alignment_.LoadText(lh::openvr::ForeignUniverses(text, AllUniverseIds(text)), &alignmentError)) Log(alignmentError);
@@ -1073,7 +1227,7 @@ class Provider : public IServerTrackedDeviceProvider {
     if (!steamFrame_) {
       const std::string roomMap = options.roomMapPath.empty() ? lh::platform::ConfigDirectory() + "/roommap.json"
                                                               : options.roomMapPath;
-      hostFrame_.Load(std::filesystem::path(roomMap).parent_path().string() + "/hostframe.json");
+      hostFrame_.Load(lh::platform::PathUtf8(lh::platform::FsPath(roomMap).parent_path()) + "/hostframe.json");
     }
     Log(steamFrame_ ? "host frame: SteamVR's (" + reference + ")" : "host frame: our room's, pinned to its origin base");
     if (!captureDir.empty()) {
@@ -1083,6 +1237,7 @@ class Provider : public IServerTrackedDeviceProvider {
     }
     session_ = lh::Session::Create(options);
     std::string error;
+    poweredOffForExit_ = false;
     if (!session_->Start(&error)) {
       Log("could not start: " + error);
       session_.reset();
@@ -1115,7 +1270,7 @@ class Provider : public IServerTrackedDeviceProvider {
     // Wired 0x2300 devices that may be headsets (Index, Beyond) are asked by their configs even
     // when a 0x2000 one (Vive, Vive Pro) already made it a yes: with an old Vive left plugged in
     // beside an Index, the Index was hidden from the stock driver, which then found only the
-    // Vive and no display for it (#28).
+    // Vive and no display for it.
     if (!maybe.empty() && (presence == Presence::Maybe || presence == Presence::Yes)) {
       // Ask the device configs (role from device_class), up to 2 s: inside Monado's 3 s.
       const bool already = presence == Presence::Yes;
@@ -1159,23 +1314,7 @@ class Provider : public IServerTrackedDeviceProvider {
   }
 
   void Cleanup() override {
-    // SteamVR's "Turn off controllers when exiting SteamVR" (power/powerOffOnExit,
-    // default on): the stock driver powers its wireless devices off at shutdown; so do
-    // we, while the USB thread still runs to send it.
-    if (session_) {
-      EVRSettingsError error = VRSettingsError_None;
-      const bool powerOff = VRSettings() ? VRSettings()->GetBool("power", "powerOffOnExit", &error) : false;
-      if ((error == VRSettingsError_None ? powerOff : true) && !std::getenv("LH_NO_POWER_OFF_ON_EXIT")) {
-        int queued = 0;
-        for (const auto& d : session_->Snapshot().devices)
-          if (d.info.connected && (d.info.role == lh::DeviceRole::Controller || d.info.role == lh::DeviceRole::Tracker))
-            queued += session_->PowerOff(d.info.serial);
-        if (queued) {
-          Log("SteamVR exiting: powering off " + std::to_string(queued) + " device(s)");
-          std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        }
-      }
-    }
+    PowerOffForExit("SteamVR exiting");  // if EnterStandby didn't already
     stop_ = true;
     if (thread_.joinable()) thread_.join();
     if (reportThread_.joinable()) reportThread_.join();  // a report being saved finishes first
@@ -1191,6 +1330,7 @@ class Provider : public IServerTrackedDeviceProvider {
     snapshot_ = {};
     alignment_ = {};
     setUpAlignment_ = {};
+    setUpUniverses_.clear();
     roomFrame_ = {};
     writtenUniverse_.clear();
     lastUniverseWrite_ = -1e300;
@@ -1231,7 +1371,7 @@ class Provider : public IServerTrackedDeviceProvider {
         std::lock_guard lock(expectedMutex_);
         expected = expectedControllers_;
       }
-      // A malformed mailbox message must not leave RunFrame: it ends vrserver (#45).
+      // A malformed mailbox message must not leave RunFrame: it ends vrserver.
       try {
         pairing_.Poll(*session_, expected);
       } catch (const std::exception& e) {
@@ -1242,7 +1382,7 @@ class Provider : public IServerTrackedDeviceProvider {
 
   // The headset's expected controllers (Prop_ExpectedControllerType_String), "" if none.
   // Main thread only: it is the one that changes devices_ (RunFrame reads the copy,
-  // expectedControllers_; walking the map there raced Main's inserts, #45).
+  // expectedControllers_; walking the map there raced Main's inserts).
   std::string ExpectedControllerType() const {
     for (const auto& [serial, device] : devices_)
       if (device && device->IsHmd() && device->Active()) return device->StringProperty(Prop_ExpectedControllerType_String);
@@ -1251,11 +1391,40 @@ class Provider : public IServerTrackedDeviceProvider {
 
   // Only leaving standby reaches the stock driver: it powers the headset's panels back up
   // there (the headset's own EnterStandby, through DeviceProxy, turned them off). Without
-  // it a headset that went to sleep stayed dark (#20). Its provider EnterStandby isn't
+  // it a headset that went to sleep stayed dark. Its provider EnterStandby isn't
   // forwarded: it would power off controllers it doesn't own here.
   bool ShouldBlockStandbyMode() override { return false; }
-  void EnterStandby() override { Log("SteamVR entering standby"); }
+  // SteamVR calls this first when it quits, Cleanup later. The devices are powered off
+  // here, as the stock driver does: if vrserver goes down on its way out, Cleanup may
+  // never run.
+  void EnterStandby() override {
+    Log("SteamVR entering standby");
+    PowerOffForExit("SteamVR entering standby");
+  }
+
+  // SteamVR's "Turn off controllers when exiting SteamVR" (power/powerOffOnExit, default
+  // on): its wireless controllers and trackers, once per session, while the USB thread
+  // still runs to send it.
+  void PowerOffForExit(const char* why) {
+    if (!session_ || poweredOffForExit_ || std::getenv("LH_NO_POWER_OFF_ON_EXIT")) return;
+    bool on = true;  // the default, also when the setting can't be read
+    if (VRSettings()) {
+      EVRSettingsError error = VRSettingsError_None;
+      const bool value = VRSettings()->GetBool("power", "powerOffOnExit", &error);
+      if (error == VRSettingsError_None) on = value;
+    }
+    if (!on) return;
+    poweredOffForExit_ = true;
+    int queued = 0;
+    for (const auto& d : session_->Snapshot().devices)
+      if (d.info.connected && (d.info.role == lh::DeviceRole::Controller || d.info.role == lh::DeviceRole::Tracker))
+        queued += session_->PowerOff(d.info.serial);
+    Log(std::string(why) + ": powering off " + std::to_string(queued) + " device(s)");
+    if (queued) std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  }
+  bool poweredOffForExit_ = false;
   void LeaveStandby() override {
+    poweredOffForExit_ = false;  // back from standby: the next one (or the exit) powers off again
     Log("SteamVR leaving standby");
     stock_.LeaveStandby();
   }
@@ -1331,7 +1500,8 @@ class Provider : public IServerTrackedDeviceProvider {
           // The stock driver's headset is up: our tracking drives its pose.
           DeviceStatic info{hmd->serial, {}, {}, {}, {}, lh::DeviceRole::Hmd, {}};
           auto device = std::make_unique<Device>(info);
-          device->AttachExternal(hmd->objectId, hmd->alive);
+          // Its GetPose returns what we publish (other drivers ask: Bigscreen's eye tracking).
+          device->AttachExternal(hmd->objectId, hmd->alive, hmd->published);
           devices_[hmd->serial] = std::move(device);
           stock_.OwnPose(hmd->objectId);
           Log("head-mounted display " + hmd->serial + ": pose from our tracking");
@@ -1349,6 +1519,7 @@ class Provider : public IServerTrackedDeviceProvider {
           }
           universe = UniverseId(aligned && steamFrame_ ? alignment_.RoomId() : snapshot_.roomId);
         }
+        rawFromWorld = BlendFrame(rawFromWorld, universe, now);
         roomPublisher_.Publish(snapshot_, rawFromWorld, now, session_->RoomResets());
         if (const std::string line = roomPublisher_.TakeLog(); !line.empty()) Log(line);
         for (auto& [serial, d] : devices_) {
@@ -1372,7 +1543,7 @@ class Provider : public IServerTrackedDeviceProvider {
           if (r != dongles.end()) d->SetDongle(r->second);
         }
       }
-      if (now - lastTuning_ >= 1.0) {  // the SteamVR settings page: applies while playing
+      if (now - lastTuning_ >= 1.0) {  // settings.json edits apply while playing
         lastTuning_ = now;
         ApplyTuning(false);
       }
@@ -1385,6 +1556,12 @@ class Provider : public IServerTrackedDeviceProvider {
       for (const auto& u : updates) {
         auto found = devices_.find(u.serial);
         if (found != devices_.end()) found->second->Update(u, SteadyNowFor(now));
+      }
+      AssignWandHands(updates);
+      HandleCommands();
+      if (now - lastSettings_ >= 0.25) {
+        lastSettings_ = now;
+        PublishSettings();
       }
       lh::platform::SleepFor(std::chrono::microseconds(500));
     }
@@ -1427,8 +1604,11 @@ class Provider : public IServerTrackedDeviceProvider {
       info.resourceRoot = d.info.resourceRoot;
       info.inputProfile = d.info.inputProfile;
       info.registeredType = d.info.registeredType;
-      Add(info, d.info.role == lh::DeviceRole::Controller ? TrackedDeviceClass_Controller
-                                                          : TrackedDeviceClass_GenericTracker);
+      info.tundraTracker = d.info.IsTundraTracker();
+      info.hidden = EqualsNoCase(d.info.deviceClass, "null");
+      Add(info, info.hidden ? TrackedDeviceClass_Invalid
+                : d.info.role == lh::DeviceRole::Controller ? TrackedDeviceClass_Controller
+                                                            : TrackedDeviceClass_GenericTracker);
     }
     for (const auto& b : snapshot_.bases) {
       if (const auto found = devices_.find(b.serial); found != devices_.end()) {
@@ -1451,10 +1631,10 @@ class Provider : public IServerTrackedDeviceProvider {
     Device* raw = device.get();
     devices_[info.serial] = std::move(device);
     // The host may call Activate() from inside this call (Monado does).
-    if (!VRServerDriverHost()->TrackedDeviceAdded(info.serial.c_str(), cls, raw))
+    if (!VRServerDriverHost()->TrackedDeviceAdded(info.serial.c_str(), cls, raw->ForHost()))
       Log("host declined " + info.serial + (cls == TrackedDeviceClass_TrackingReference ? " (base station)" : ""));
     else
-      Log("registered " + info.serial);
+      Log("registered " + info.serial + (info.hidden ? " (device_class null: hidden from SteamVR's device list)" : ""));
   }
 
   // SteamVR's base station power management asks the headset to switch the Bluetooth
@@ -1498,11 +1678,39 @@ class Provider : public IServerTrackedDeviceProvider {
   lh::SessionSnapshot snapshot_;
   lh::openvr::RawAlignment alignment_;
   bool steamFrame_ = false;
+  // The host frame eases into a changed room frame (a base re-solved moves it a few mm or cm)
+  // over ~0.3 s instead of every device and base jumping with it. A new room (universe) or a
+  // jump too big to be a correction (over 0.5 m or 20 deg) is taken at once.
+  Eigen::Isometry3d BlendFrame(const Eigen::Isometry3d& target, uint64_t universe, double now) {
+    const Eigen::Quaterniond qt(target.rotation()), qs(blendedRaw_.rotation());
+    const double move = (target.translation() - blendedRaw_.translation()).norm(), turn = qs.angularDistance(qt);
+    if (!haveBlended_ || universe != blendedUniverse_ || move > 0.5 || turn > 20 * M_PI / 180) {
+      blendedRaw_ = target;
+    } else if (move > 1e-5 || turn > 1e-5) {
+      const double a = 1 - std::exp(-std::clamp(now - blendT_, 0.0, 0.1) / 0.1);   // time constant 0.1 s: ~0.3 s to settle
+      Eigen::Isometry3d b = Eigen::Isometry3d::Identity();
+      b.linear() = qs.slerp(a, qt).normalized().toRotationMatrix();
+      b.translation() = blendedRaw_.translation() + a * (target.translation() - blendedRaw_.translation());
+      blendedRaw_ = b;
+    } else {
+      blendedRaw_ = target;
+    }
+    haveBlended_ = true;
+    blendedUniverse_ = universe;
+    blendT_ = now;
+    return blendedRaw_;
+  }
+  Eigen::Isometry3d blendedRaw_ = Eigen::Isometry3d::Identity();
+  bool haveBlended_ = false;
+  uint64_t blendedUniverse_ = 0;
+  double blendT_ = 0;
+
   // SteamVR's rooms (steam_rooms.hpp): the frame and universe of the active room.
   bool steamRooms_ = false;
   bool replay_ = false;
   std::string referencePath_;
   lh::openvr::RawAlignment setUpAlignment_;  // SteamVR's universes with Room Setup done
+  std::set<std::string> setUpUniverses_;      // every universe with Room Setup (chaperone_info.vrchap)
   enum class RoomFrame { Undecided, Steam, Own };
   struct {
     std::string room;
@@ -1540,6 +1748,13 @@ class Provider : public IServerTrackedDeviceProvider {
       *rawFromWorld = hostFrame_.Update(snapshot_, now);
       *universe = 0;
       return;
+    }
+    // Room Setup done in our room's own universe (as with 1.0.2, which had no SteamVR rooms):
+    // that is the user's room. A SteamVR universe sharing a base would replace its floor and
+    // tilt with another room's, re-estimated by the stock driver on every start.
+    if (f.frame == RoomFrame::Undecided && !imported && setUpUniverses_.count(std::to_string(UniverseId(f.room)))) {
+      f.frame = RoomFrame::Own;
+      Log("room " + f.room + ": its own universe " + std::to_string(UniverseId(f.room)) + " (Room Setup done for it)");
     }
     auto& steam = imported ? alignment_ : setUpAlignment_;
     if (f.frame != RoomFrame::Own && steam.Update(snapshot_)) {
@@ -1611,8 +1826,255 @@ class Provider : public IServerTrackedDeviceProvider {
   double lastSnapshot_ = -1e300;
   double lastTelemetry_ = -1e300;
   std::string recording_;  // the settings page's recording, while on
+  // openhouse-overlay: settings it set on a host with no settings page (by SteamVR key), and
+  // what ApplyTuning last applied (published to it).
+
+  nlohmann::json applied_ = nlohmann::json::object();
+  double lastSettings_ = -1e300;
   std::thread reportThread_;  // saving a bug report
   std::atomic<bool> reportDone_{true};
+  // The last bug report saved (openhouse-overlay shows where): its path, or "" with the error.
+  std::mutex reportMutex_;
+  std::string lastReport_, lastReportError_;
+  uint64_t reportCount_ = 0;
+
+  // ---- openhouse-overlay (telemetry commands, lh/telemetry.hpp) ----
+  // The settings it may change: SteamVR settings keys (the settings page's), with their type.
+  enum class SettingType { Bool, Number };
+  static std::optional<SettingType> OverlaySetting(const std::string& key) {
+    static const std::map<std::string, SettingType> keys = {
+        {"positionSmoothingMs", SettingType::Number}, {"rotationSmoothingMs", SettingType::Number},
+        {"predictWithAcceleration", SettingType::Bool},
+        {"mixedLight", SettingType::Bool}, {"mixedLightControllers", SettingType::Bool},
+        {"mixedLightTrackers", SettingType::Bool}, {"mixedLightScout", SettingType::Bool},
+        {"mixedLightPreferLh2", SettingType::Bool}, {"mixedLightRotorReference", SettingType::Bool},
+        {"useSteamVRRooms", SettingType::Bool}};  // takes effect when the runtime restarts
+    const auto it = keys.find(key);
+    return it == keys.end() ? std::nullopt : std::optional<SettingType>(it->second);
+  }
+
+  static bool steamvrHostNow() { return HostName().rfind("vrserver", 0) == 0; }
+
+  // Room calibration from openhouse-overlay (host_frame.hpp), with the devices' poses where
+  // the runtime sees them: "floor" (this device is on the floor, `height` m above it),
+  // "forward" (where it points is forward), "center" (where it is is the middle),
+  // "nudgeFloor" (`metres`), "nudgeYaw" (`degrees`), "reset".
+  bool Calibrate(const nlohmann::json& j, std::string* error) {
+    if (steamvrHostNow() || steamFrame_) { *error = "SteamVR has its own Room Setup"; return false; }
+    if (!hostFrame_.Anchored()) { *error = "the room isn't placed yet"; return false; }
+    const std::string action = j.value("action", "");
+    Eigen::Isometry3d c = hostFrame_.Calibration();
+    auto yawAbout = [](double radians) {
+      Eigen::Isometry3d t = Eigen::Isometry3d::Identity();
+      t.linear() = Eigen::AngleAxisd(radians, Eigen::Vector3d::UnitY()).toRotationMatrix();
+      return t;
+    };
+    if (action == "reset") c.setIdentity();
+    else if (action == "floorControllers") {
+      // The controllers lying on the floor: their middle sits about this high above it.
+      constexpr double kControllerOnFloor = 0.04;  // m
+      double sum = 0;
+      int n = 0;
+      for (const auto& d : snapshot_.devices) {
+        if (d.info.role != lh::DeviceRole::Controller || !d.info.connected || !d.pose.valid) continue;
+        const auto& p = d.pose.worldFromHead.position;
+        sum += (c * hostFrame_.Pinned() * Eigen::Vector3d(p[0], p[1], p[2])).y();
+        ++n;
+      }
+      if (!n) { *error = "no controller is tracking"; return false; }
+      c.translation().y() -= sum / n - kControllerOnFloor;
+    }
+    else if (action == "nudgeFloor") c.translation().y() -= j.value("metres", 0.0);
+    else if (action == "nudgeYaw") c = yawAbout(j.value("degrees", 0.0) * 0.017453292519943295) * c;
+    else {
+      const std::string serial = j.value("serial", "");
+      const lh::DeviceState* device = nullptr;
+      for (const auto& d : snapshot_.devices) if (d.info.serial == serial) device = &d;
+      if (!device || !device->pose.valid) { *error = serial + " isn't tracking"; return false; }
+      // The device where the runtime sees it now.
+      const auto& p = device->pose.worldFromHead;
+      Eigen::Isometry3d worldFromDevice = Eigen::Isometry3d::Identity();
+      worldFromDevice.linear() = Eigen::Quaterniond(p.orientation[0], p.orientation[1], p.orientation[2], p.orientation[3]).normalized().toRotationMatrix();
+      worldFromDevice.translation() = Eigen::Vector3d(p.position.data());
+      const Eigen::Isometry3d raw = c * hostFrame_.Pinned() * worldFromDevice;
+      if (action == "floor") {
+        c.translation().y() -= raw.translation().y() - j.value("height", 0.0);
+      } else if (action == "center") {
+        c.translation().x() -= raw.translation().x();
+        c.translation().z() -= raw.translation().z();
+      } else if (action == "forward") {
+        // Where it points (-z), on the floor, becomes forward (-z): a turn about the middle.
+        const Eigen::Vector3d f = raw.rotation() * Eigen::Vector3d(0, 0, -1);
+        if (std::hypot(f.x(), f.z()) < 0.3) { *error = "point it level, not up or down"; return false; }
+        c = yawAbout(std::atan2(f.x(), -f.z())) * c;
+      } else {
+        *error = "unknown calibration " + action;
+        return false;
+      }
+    }
+    if (!hostFrame_.SetCalibration(c)) { *error = "the room isn't placed yet"; return false; }
+    Log("room calibration: " + action + (j.contains("serial") ? " from " + j.value("serial", "") : ""));
+    lastSnapshot_ = -1e300;  // the devices take the new frame on the next pass
+    return true;
+  }
+
+  void PublishSettings() {
+    nlohmann::json j = applied_;
+    j["host"] = HostName();
+    j["steamvr"] = HostName().rfind("vrserver", 0) == 0;
+    j["live"] = !replay_;
+    j["recording"] = !recording_.empty();
+    j["recordingPath"] = recording_;
+    j["reportBusy"] = !reportDone_.load();
+    {
+      std::lock_guard lock(reportMutex_);
+      j["report"] = {{"count", reportCount_}, {"path", lastReport_}, {"error", lastReportError_}};
+    }
+    j["steamRooms"] = steamRooms_;
+    {
+      // Room calibration: only in our own frame, without SteamVR's Room Setup.
+      const Eigen::Isometry3d c = hostFrame_.Calibration();
+      const Eigen::Matrix3d r = c.rotation();
+      j["calibration"] = {{"available", !steamvrHostNow() && hostFrame_.Anchored() && !steamFrame_},
+                          {"yaw", std::atan2(r(0, 2), r(0, 0)) * 57.29577951308232},
+                          {"floor", -c.translation().y()}, {"x", c.translation().x()}, {"z", c.translation().z()}};
+    }
+    g_telemetry.SetSettings(j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+  }
+
+  // Main thread: what clients asked for since the last pass. Each gets a reply.
+  // Wands with no hand set, as SteamVR's own driver: once both are seen with the
+  // headset, the one to the headset's right is the right hand. Kept until a wand turns
+  // off; one turned on later takes the free hand.
+  void AssignWandHands(const std::vector<lh::DeviceUpdate>& updates) {
+    const lh::DeviceUpdate* hmd = nullptr;
+    struct Wand { Device* d; const lh::DeviceUpdate* u; };
+    std::vector<Wand> wands;
+    for (const auto& u : updates) {
+      auto found = devices_.find(u.serial);
+      if (found == devices_.end() || !found->second || !found->second->Active()) continue;
+      Device* d = found->second.get();
+      if (d->IsHmd()) { if (u.pose.valid) hmd = &u; continue; }
+      if (!d->AutoHandWand()) continue;
+      if (!u.connected || !u.enabled) { d->SetAutoHand(0); continue; }
+      wands.push_back({d, &u});
+    }
+    if (wands.size() != 2) return;
+    Wand& a = wands[0];
+    Wand& b = wands[1];
+    const int L = TrackedControllerRole_LeftHand, R = TrackedControllerRole_RightHand;
+    if (a.d->AutoHand() && a.d->AutoHand() != b.d->AutoHand()) {
+      if (!b.d->AutoHand()) b.d->SetAutoHand(a.d->AutoHand() == L ? R : L);
+      return;
+    }
+    if (b.d->AutoHand() && !a.d->AutoHand()) { a.d->SetAutoHand(b.d->AutoHand() == L ? R : L); return; }
+    if (!hmd || !a.u->pose.valid || !b.u->pose.valid) return;
+    auto pos = [](const lh::DeviceUpdate& u) {
+      const auto& p = u.pose.worldFromImu.position;
+      return Eigen::Vector3d(p[0], p[1], p[2]);
+    };
+    const auto& ho = hmd->pose.worldFromImu.orientation;
+    const auto& hh = hmd->pose.imuFromHead.orientation;
+    const Eigen::Quaterniond worldFromHead = Eigen::Quaterniond(ho[0], ho[1], ho[2], ho[3]) *
+                                             Eigen::Quaterniond(hh[0], hh[1], hh[2], hh[3]);
+    const Eigen::Vector3d right = worldFromHead * Eigen::Vector3d::UnitX();
+    const Eigen::Vector3d head = pos(*hmd);
+    const double da = right.dot(pos(*a.u) - head), db = right.dot(pos(*b.u) - head);
+    if (std::abs(da - db) < 0.1) return;  // side by side in front: wait until they part
+    a.d->SetAutoHand(da > db ? R : L);
+    b.d->SetAutoHand(da > db ? L : R);
+  }
+
+  void HandleCommands() {
+    for (const auto& c : g_telemetry.TakeCommands()) {
+      const nlohmann::json j = nlohmann::json::parse(c.json, nullptr, false);
+      if (!j.is_object() || j.value("type", "") != "command") continue;
+      nlohmann::json reply = {{"type", "reply"}, {"ok", false}};
+      if (j.contains("id")) reply["id"] = j.at("id");
+      try {
+        std::string error;
+        reply["ok"] = RunCommand(j, &error);
+        if (!error.empty()) reply["error"] = error;
+      } catch (const std::exception& e) {
+        reply["error"] = e.what();
+      }
+      g_telemetry.Reply(c.client, reply.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+    }
+  }
+
+  bool RunCommand(const nlohmann::json& j, std::string* error) {
+    const std::string cmd = j.value("cmd", "");
+    auto text = [&](const char* key) {
+      const auto it = j.find(key);
+      return it != j.end() && it->is_string() ? it->get<std::string>() : std::string();
+    };
+    if (!session_) { *error = "no session"; return false; }
+    Log(lh::LogLevel::Debug, "overlay: " + cmd + (text("serial").empty() ? "" : " " + text("serial")));
+    if (cmd == "set") {
+      const std::string key = text("key");
+      const auto type = OverlaySetting(key);
+      const auto value = j.find("value");
+      if (!type || value == j.end()) { *error = "unknown setting " + key; return false; }
+      if (*type == SettingType::Bool && !value->is_boolean()) { *error = key + " takes true or false"; return false; }
+      if (*type == SettingType::Number && !value->is_number()) { *error = key + " takes a number"; return false; }
+      if (!UpdateSettings([&](nlohmann::json& s) { SetSetting(s, key, *value); return true; })) {
+        *error = "couldn't save " + SettingsPath();
+        return false;
+      }
+      ApplyTuning(false);
+      Log("overlay set " + key + " to " + value->dump());
+      return true;
+    }
+    if (cmd == "record") {
+      const bool on = j.value("on", false);
+      recordWanted_ = on;
+      ApplyTuning(false);
+      if (on != recording_.empty()) return true;
+      *error = on ? "recording needs the USB devices (not available here)" : "couldn't stop";
+      return false;
+    }
+    if (cmd == "calibrate") return Calibrate(j, error);
+    if (cmd == "resetRoom") {
+      Log("room reset from openhouse-overlay");
+      session_->ResetRoom();
+      return true;
+    }
+    if (cmd == "saveReport") {
+      if (!reportDone_) { *error = "a bug report is still being saved"; return false; }
+      SaveReport(recording_);
+      return true;
+    }
+    const std::string serial = text("serial");
+    if (cmd == "renameTracker") {
+      const auto value = j.find("name");
+      const auto name = lh::openvr::ValidateTrackerRename(snapshot_.devices, serial, value == j.end() ? nlohmann::json{} : *value, error);
+      if (!name) return false;
+      if (!UpdateSettings([&](nlohmann::json& settings) { return lh::openvr::SetTrackerName(settings, serial, *name); })) {
+        *error = "couldn't save " + SettingsPath();
+        return false;
+      }
+      // On a Doorman Dongle that keeps names: there too, so the name goes with the dongle.
+      for (const auto& r : session_->Receivers())
+        if (r.kind == "openhouse" && r.keepsName && r.connected == serial) session_->SetReceiverName(r.serial, *name);
+      ApplyTuning(false);
+      return true;
+    }
+    if (cmd == "identify") {
+      // A short buzz on a controller or tracker, to tell which one it is.
+      return session_->Haptic(serial, 160, 1.0, 0.4) || (*error = "no haptics for " + serial, false);
+    }
+    if (cmd == "powerOff") return session_->PowerOff(serial) || (*error = serial + " can't be powered off", false);
+    if (cmd == "enable") {
+      session_->SetDeviceEnabled(serial, j.value("enabled", true));
+      return true;
+    }
+    if (cmd == "pair") {
+      const double seconds = std::clamp(j.value("seconds", 30.0), 0.0, 300.0);
+      return session_->SetPairing(text("receiver"), seconds) || (*error = "no receiver " + text("receiver"), false);
+    }
+    *error = "unknown command " + cmd;
+    return false;
+  }
 
   // The bug report zip (lh/bug_report.hpp) with this recording, off the host thread.
   void SaveReport(const std::string& recording) {
@@ -1629,11 +2091,15 @@ class Provider : public IServerTrackedDeviceProvider {
       // The USB thread closes the capture on its next pass: let it finish the file.
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
       // Nothing thrown here may leave the thread: that is std::terminate, and it took
-      // vrserver down with the report unwritten (#34).
+      // vrserver down with the report unwritten.
       try {
         std::string error;
         const std::string path = lh::SaveBugReport(options, &error);
         Log(path.empty() ? "bug report failed: " + error : "bug report saved: " + path);
+        std::lock_guard lock(reportMutex_);
+        lastReport_ = path;
+        lastReportError_ = path.empty() ? error : "";
+        ++reportCount_;
       } catch (const std::exception& e) {
         Log(std::string("bug report failed: ") + e.what() + "; the recording stays in " + options.recording);
       } catch (...) {
@@ -1666,81 +2132,170 @@ class Provider : public IServerTrackedDeviceProvider {
   }
   double lastTuning_ = -1e300;
 
-  // SteamVR settings, section driver_openhouse (the page from settingsschema.vrsettings,
-  // which the installer puts in the lighthouse driver's resources). Missing values are
-  // written with their defaults first, so the page shows them.
-  static constexpr const char* kSection = "driver_openhouse";
-  // On the driver thread: a throw from here (a filesystem call when recording starts or
-  // stops, #34) must not end it, or vrserver with it.
-  void ApplyTuning(bool writeDefaults) {
-    try {
-      ApplyTuningOnce(writeDefaults);
-    } catch (const std::exception& e) {
-      Log(std::string("applying the SteamVR settings failed: ") + e.what());
-    } catch (...) {
-      Log("applying the SteamVR settings failed");
-    }
+  // openhouse's settings: settings.json in its config folder, the same file the session
+  // reads (mixedLight, hideLostDevices, disabledDevices...). openhouse-overlay changes them
+  // with "set"; a hand edit is picked up within a second (ApplyTuning runs every second).
+  static std::string SettingsPath() { return lh::platform::ConfigDirectory() + "/settings.json"; }
+  static nlohmann::json ReadSettings() {
+    std::ifstream in(lh::platform::FsPath(SettingsPath()));
+    if (!in) return nlohmann::json::object();
+    nlohmann::json j = nlohmann::json::parse(in, nullptr, false);
+    return j.is_object() ? j : nlohmann::json::object();
   }
-  void ApplyTuningOnce(bool writeDefaults) {
-    if (!session_ || !VRSettings()) return;
-    auto number = [&](const char* key, float fallback) {
-      EVRSettingsError e = VRSettingsError_None;
-      const float v = VRSettings()->GetFloat(kSection, key, &e);
-      if (e == VRSettingsError_None) return v;
-      if (writeDefaults) VRSettings()->SetFloat(kSection, key, fallback);
-      return fallback;
-    };
-    auto flag = [&](const char* key, bool fallback) {
-      EVRSettingsError e = VRSettingsError_None;
-      const bool v = VRSettings()->GetBool(kSection, key, &e);
-      if (e == VRSettingsError_None) return v;
-      if (writeDefaults) VRSettings()->SetBool(kSection, key, fallback);
-      return fallback;
-    };
-    const double position = number("positionSmoothingMs", 60) / 1000.0;
-    const double rotation = number("rotationSmoothingMs", 60) / 1000.0;
-    const bool acceleration = flag("predictWithAcceleration", true);
-    session_->SetOutputTuning(position, rotation, acceleration);
-    // 1.0 and 2.0 base stations together (ai/driver/mixed_stations.md). SteamVR: the settings
-    // page, its missing values seeded from settings.json "mixedLight". Other hosts keep
-    // settings.json's: Monado's steamvr_lh answers every GetBool with false and no error.
-    if (HostName().rfind("vrserver", 0) == 0) {
-      // The sub-toggles default to on, but a key SteamVR has no default for can read false with
-      // no error (they showed off on Windows): the first time, they're written explicitly, and
-      // a hidden marker keeps whatever is chosen after that.
-      if (writeDefaults) {
-        EVRSettingsError e = VRSettingsError_None;
-        const lh::MixedLightOptions defaults = session_->MixedLight();
-        if (!VRSettings()->GetBool(kSection, "mixedLightDefaultsWritten", &e)) {
-          VRSettings()->SetBool(kSection, "mixedLightControllers", defaults.controllers);
-          VRSettings()->SetBool(kSection, "mixedLightTrackers", defaults.trackers);
-          VRSettings()->SetBool(kSection, "mixedLightScout", defaults.scout);
-          VRSettings()->SetBool(kSection, "mixedLightDefaultsWritten", true);
-        }
-        // The rotor reference came on by default after the marker above was written, so it has one of its own.
-        if (!VRSettings()->GetBool(kSection, "mixedLightRotorReferenceDefaultWritten", &e)) {
-          VRSettings()->SetBool(kSection, "mixedLightRotorReference", defaults.rotorReference);
-          VRSettings()->SetBool(kSection, "mixedLightRotorReferenceDefaultWritten", true);
+  // Preserve unrelated settings and skip the write if the callback reports no change.
+  bool UpdateSettings(const std::function<bool(nlohmann::json&)>& change) {
+    try {
+      const std::string settingsPath = SettingsPath();
+      const auto path = lh::platform::FsPath(settingsPath);
+      nlohmann::json j = nlohmann::json::object();
+      {
+        std::ifstream in(path);
+        if (in) {
+          j = nlohmann::json::parse(in, nullptr, false);
+          // Never overwrite a file we can't read: its controllers and roles would be lost.
+          if (!j.is_object()) { Log("settings " + settingsPath + " isn't valid JSON: not changed"); return false; }
         }
       }
-      const lh::MixedLightOptions file = session_->MixedLight();
-      lh::MixedLightOptions mixed;
-      mixed.enabled = flag("mixedLight", file.enabled);
-      mixed.controllers = flag("mixedLightControllers", file.controllers);
-      mixed.trackers = flag("mixedLightTrackers", file.trackers);
-      mixed.scout = flag("mixedLightScout", file.scout);
-      mixed.preferLh2 = flag("mixedLightPreferLh2", file.preferLh2);    // the same
-      mixed.rotorReference = flag("mixedLightRotorReference", file.rotorReference);  // on by default, written above
-      session_->SetMixedLight(mixed);
-      g_hideLost = flag("hideLostDevices", session_->HideLostDevices());
-    } else {
-      g_hideLost = session_->HideLostDevices();
+      if (!change(j)) return true;
+      std::filesystem::create_directories(path.parent_path());
+      auto temp = path;
+      temp += ".tmp";
+      {
+        std::ofstream out(temp);
+        out << j.dump(2) << "\n";
+        out.close();
+        if (!out) { Log("cannot write " + settingsPath + ".tmp"); return false; }
+      }
+      lh::platform::ReplaceFile(temp, path);
+      return true;
+    } catch (const std::exception& e) {
+      Log(std::string("saving settings failed: ") + e.what());
+      return false;
     }
-    // Record session: raw device data to <data>/recordings while on (replay with
-    // `lhtool session`); turning it off saves the bug report zip with it.
-    const bool record = flag("record", false);
-    if (record != !recording_.empty()) {
-      if (record) {
+  }
+  // The overlay's names for the mixedLight object's fields.
+  static const char* MixedField(const std::string& key) {
+    static const std::map<std::string, const char*> fields = {
+        {"mixedLight", "enabled"}, {"mixedLightControllers", "controllers"}, {"mixedLightTrackers", "trackers"},
+        {"mixedLightScout", "scout"}, {"mixedLightPreferLh2", "preferLh2"}, {"mixedLightRotorReference", "rotorReference"}};
+    const auto it = fields.find(key);
+    return it == fields.end() ? nullptr : it->second;
+  }
+  static void SetSetting(nlohmann::json& j, const std::string& key, const nlohmann::json& value) {
+    if (const char* field = MixedField(key)) {
+      if (!j.contains("mixedLight") || !j["mixedLight"].is_object())
+        j["mixedLight"] = {{"enabled", j.contains("mixedLight") && j["mixedLight"].is_boolean() && j["mixedLight"].get<bool>()}};
+      j["mixedLight"][field] = value;
+    } else {
+      j[key] = value;
+    }
+  }
+
+  // Older versions kept these on a page in SteamVR's settings (steamvr.vrsettings, section
+  // driver_openhouse). Each value set there that settings.json doesn't have yet moves over,
+  // once. Read from the file itself: SteamVR's GetBool answers false with no error for a key
+  // it has no default for, which would turn options off.
+  void MigrateSteamVRSettings() {
+    // <Steam>/config/, not SteamConfigDirectory() (<Steam>/config/lighthouse): there it was never found.
+    const std::string path = lh::platform::SteamRoot() + "/config/steamvr.vrsettings";
+    std::ifstream in(std::filesystem::u8path(path));
+    if (!in) return;
+    const nlohmann::json vr = nlohmann::json::parse(in, nullptr, false);
+    if (!vr.is_object() || !vr.contains("driver_openhouse") || !vr["driver_openhouse"].is_object()) return;
+    const nlohmann::json& old = vr["driver_openhouse"];
+    const nlohmann::json current = ReadSettings();
+    auto has = [&](const std::string& key) {
+      if (const char* field = MixedField(key))
+        return current.contains("mixedLight") && (current["mixedLight"].is_object() ? current["mixedLight"].contains(field) : std::string(field) == "enabled");
+      return current.contains(key);
+    };
+    std::vector<std::string> moved;
+    nlohmann::json values = nlohmann::json::object();
+    for (const char* key : {"positionSmoothingMs", "rotationSmoothingMs", "predictWithAcceleration", "hideLostDevices",
+                            "useSteamVRRooms", "mixedLight", "mixedLightControllers", "mixedLightTrackers",
+                            "mixedLightScout", "mixedLightPreferLh2", "mixedLightRotorReference"}) {
+      if (!old.contains(key) || has(key)) continue;
+      const auto& v = old[key];
+      if (!v.is_boolean() && !v.is_number()) continue;
+      values[key] = v;
+      moved.push_back(key);
+    }
+    if (moved.empty()) return;
+    if (UpdateSettings([&](nlohmann::json& j) {
+          for (const auto& [k, v] : values.items()) SetSetting(j, k, v);
+          return true;
+        }))
+      Log("moved " + std::to_string(moved.size()) + " settings from SteamVR's settings to " + SettingsPath());
+  }
+
+  // On the driver thread: a throw from here (a filesystem call when recording starts or
+  // stops) must not end it, or vrserver with it.
+  void ApplyTuning(bool first) {
+    try {
+      ApplyTuningOnce(first);
+    } catch (const std::exception& e) {
+      Log(std::string("applying the settings failed: ") + e.what());
+    } catch (...) {
+      Log("applying the settings failed");
+    }
+  }
+  void ApplyTuningOnce(bool first) {
+    (void)first;
+    if (!session_) return;
+    const nlohmann::json f = ReadSettings();
+    auto number = [&](const char* key, double fallback) {
+      const auto it = f.find(key);
+      return it != f.end() && it->is_number() ? it->get<double>() : fallback;
+    };
+    auto flag = [&](const nlohmann::json& j, const char* key, bool fallback) {
+      const auto it = j.find(key);
+      return it != j.end() && it->is_boolean() ? it->get<bool>() : fallback;
+    };
+    const double position = std::clamp(number("positionSmoothingMs", 60), 0.0, 1000.0) / 1000.0;
+    const double rotation = std::clamp(number("rotationSmoothingMs", 60), 0.0, 1000.0) / 1000.0;
+    const bool acceleration = flag(f, "predictWithAcceleration", true);
+    session_->SetOutputTuning(position, rotation, acceleration);
+    applied_ = {{"positionSmoothingMs", position * 1000}, {"rotationSmoothingMs", rotation * 1000},
+                {"predictWithAcceleration", acceleration}, {"useSteamVRRooms", flag(f, "useSteamVRRooms", true)}};
+    if (const auto names = f.find("trackerNames"); names != f.end() && names->is_object())
+      applied_["trackerNames"] = *names;
+    // A Doorman Dongle keeps its devices' names (firmware 0x0025+): those go with the dongle, so
+    // they win over this PC's settings.
+    for (const auto& r : session_->Receivers())
+      if (r.kind == "openhouse" && r.keepsName && !r.connected.empty() && !r.name.empty()) {
+        auto& entry = applied_["trackerNames"][r.connected];
+        // A name over the dongle's 59 bytes is kept cut there: the whole one here stays.
+        if (!entry.is_string() || entry.get_ref<const std::string&>().rfind(r.name, 0) != 0) entry = r.name;
+      }
+    // 1.0 and 2.0 base stations together (ai/driver/mixed_stations.md): settings.json
+    // "mixedLight", true/false or an object (session.cpp LoadSettings has the fields).
+    lh::MixedLightOptions mixed = session_->MixedLight();
+    if (const auto m = f.find("mixedLight"); m != f.end()) {
+      if (m->is_boolean()) {
+        mixed.enabled = m->get<bool>();
+      } else if (m->is_object()) {
+        mixed.enabled = flag(*m, "enabled", false);
+        mixed.controllers = flag(*m, "controllers", true);
+        mixed.trackers = flag(*m, "trackers", true);
+        mixed.scout = flag(*m, "scout", true);
+        mixed.preferLh2 = flag(*m, "preferLh2", false);
+        mixed.rotorReference = flag(*m, "rotorReference", true);
+      }
+    }
+    const lh::MixedLightOptions now = session_->MixedLight();
+    if (mixed.enabled != now.enabled || mixed.controllers != now.controllers || mixed.trackers != now.trackers ||
+        mixed.scout != now.scout || mixed.preferLh2 != now.preferLh2 || mixed.rotorReference != now.rotorReference)
+      session_->SetMixedLight(mixed);
+    applied_["mixedLight"] = mixed.enabled;
+    applied_["mixedLightControllers"] = mixed.controllers;
+    applied_["mixedLightTrackers"] = mixed.trackers;
+    applied_["mixedLightScout"] = mixed.scout;
+    applied_["mixedLightPreferLh2"] = mixed.preferLh2;
+    applied_["mixedLightRotorReference"] = mixed.rotorReference;
+    // Record session (openhouse-overlay): raw device data to <data>/recordings while on
+    // (replay with `lhtool session`); turning it off saves the bug report zip with it.
+    if (recordWanted_ != !recording_.empty()) {
+      if (recordWanted_) {
         const std::time_t t = std::time(nullptr);
         char name[64];
         std::strftime(name, sizeof name, "recording-%Y%m%d-%H%M%S.lhraw", std::localtime(&t));
@@ -1752,7 +2307,7 @@ class Provider : public IServerTrackedDeviceProvider {
           Log("recording to " + recording_);
         } else {
           Log("cannot record to " + dir);
-          VRSettings()->SetBool(kSection, "record", false);
+          recordWanted_ = false;
         }
       } else {
         session_->SetCapture("");
@@ -1761,13 +2316,8 @@ class Provider : public IServerTrackedDeviceProvider {
         recording_.clear();
       }
     }
-    // A one-shot switch: the settings page turns it on, we reset the room and turn it off.
-    if (flag("resetRoom", false)) {
-      VRSettings()->SetBool(kSection, "resetRoom", false);
-      Log("room reset from the SteamVR settings");
-      session_->ResetRoom();
-    }
   }
+  bool recordWanted_ = false;
 };
 
 Provider g_provider;
@@ -1779,9 +2329,16 @@ Provider g_provider;
 #else
 #define LH_DRIVER_EXPORT __attribute__((visibility("default")))
 #endif
+// The installed version, found by openhouse-installer in the file ("openhouse-version:X.Y.Z;").
+// Exported, so the linker keeps it.
+extern "C" LH_DRIVER_EXPORT const char openhouse_version[] = "openhouse-version:" LH_VERSION_STRING ";";
+// When it was built (Unix seconds, "openhouse-build-time:N;"): the installer orders two builds of
+// one version by it.
+extern "C" LH_DRIVER_EXPORT const char openhouse_build_time[] = "openhouse-build-time:" LH_BUILD_TIME_STRING ";";
+
 extern "C" LH_DRIVER_EXPORT void* HmdDriverFactory(const char* interfaceName, int* returnCode) {
   if (std::strcmp(interfaceName, IServerTrackedDeviceProvider_Version) == 0) return &g_provider;
-  if (std::strcmp(interfaceName, IVRWatchdogProvider_Version) == 0) return lh::openvr::WatchdogProvider();  // #38
+  if (std::strcmp(interfaceName, IVRWatchdogProvider_Version) == 0) return lh::openvr::WatchdogProvider();
   if (returnCode) *returnCode = VRInitError_Init_InterfaceNotFound;
   return nullptr;
 }

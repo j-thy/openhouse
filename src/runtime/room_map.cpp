@@ -80,7 +80,7 @@ double RoomMap::Now() {
 
 bool RoomMap::Load(const std::string& path, std::string* error) {
   try {
-    std::ifstream in(path);
+    std::ifstream in(platform::FsPath(path));
     if (!in) { if (error) error->clear(); return true; }
     const json j = json::parse(in);
     std::vector<Room> rooms;
@@ -160,7 +160,7 @@ bool RoomMap::Load(const std::string& path, std::string* error) {
     return true;
   } catch (const std::exception& e) {
     // Moved aside, or the next save replaced it with an empty map and every stored
-    // room was lost (#43). Its rooms can still be taken back from that copy by hand.
+    // room was lost. Its rooms can still be taken back from that copy by hand.
     const std::string kept = path + ".bad-" + std::to_string(std::time(nullptr));
     std::error_code ec;
     std::filesystem::rename(path, kept, ec);
@@ -188,6 +188,7 @@ bool RoomMap::Save(const std::string& path, std::string* error) const {
     json configs = json::array();
     for (const auto& [serial, c] : configs_) {
       json jc = ConfigJson(c.first, c.second);
+      if (const auto kept = keptGravity_.find(serial); kept != keptGravity_.end()) jc["gravity"] = kept->second;
       const auto frame = frames_.find(serial);
       if (frame != frames_.end()) {
         std::string bits;
@@ -201,7 +202,7 @@ bool RoomMap::Save(const std::string& path, std::string* error) const {
     if (target.has_parent_path()) std::filesystem::create_directories(target.parent_path());
     const std::string temp = path + ".tmp";
     {
-      std::ofstream out(temp);
+      std::ofstream out(platform::FsPath(temp));
       out << j.dump(2) << "\n";
       out.close();  // a write error can show only when the buffer goes out
       if (!out) throw std::runtime_error("write failed");
@@ -315,15 +316,30 @@ void RoomMap::Suspect(RoomBase& b) {
   b.rotationVariance = std::max(b.rotationVariance, 3 * 0.003 * 0.003);
 }
 
+// A base that may have moved a little: Suspect's loosening, locked or not, so the room solver can move it.
+// One that didn't move is solved back where it was and locks again with fresh keyframes.
+void RoomMap::Loosen(RoomBase& b) {
+  constexpr int kLoosenedEvidence = 30;
+  b.observations = std::min(b.observations, kLoosenedEvidence);
+  b.storedObservations = std::min(b.storedObservations, kLoosenedEvidence);
+  b.positionVariance = std::max(b.positionVariance, 3 * 0.01 * 0.01);
+  b.rotationVariance = std::max(b.rotationVariance, 3 * 0.003 * 0.003);
+  Changed();
+}
+
 void RoomMap::OnBaseSeen(const BaseConfig& config, const BaseDynamicState& dynamic) {
   const uint32_t serial = config.serial;
+  if (Conflicted(serial)) return;
   const auto previousConfig = configs_.find(serial);
   if (previousConfig == configs_.end() || previousConfig->second.first.cal != config.cal) dirty_ = true;
   const bool firstSighting = !seenResetCount_.count(serial);
   std::optional<Eigen::Vector3d> saved;  // the gravity this base had when the room was saved
   if (firstSighting && previousConfig != configs_.end()) {
     const auto& g = previousConfig->second.second.accelDir;
-    if (Eigen::Vector3d(g[0], g[1], g[2]).norm() > 0.5) saved = Eigen::Vector3d(g[0], g[1], g[2]).normalized();
+    if (Eigen::Vector3d(g[0], g[1], g[2]).norm() > 0.5) {
+      saved = Eigen::Vector3d(g[0], g[1], g[2]).normalized();
+      if (!keptGravity_.count(serial)) keptGravity_[serial] = g;
+    }
   }
   configs_[serial] = {config, dynamic};
   const int resetCount = dynamic.sysUnlockCount;
@@ -372,6 +388,7 @@ void RoomMap::OnBaseSeen(const BaseConfig& config, const BaseDynamicState& dynam
       rooms_.push_back(fresh);
       active_ = int(rooms_.size()) - 1;
       solvedTarget_.clear();
+      keptGravity_.clear();  // a new room: its bases are learned where they are now
       Log("Created new room " + fresh.id);
       Changed();
     }
@@ -429,9 +446,18 @@ void RoomMap::SetOotxFrame(uint32_t serial, const std::vector<uint8_t>& frame) {
   if (stored != frame) { stored = frame; dirty_ = true; }
 }
 
+void RoomMap::SetConflictedBases(std::set<uint32_t> bases) {
+  if (bases == conflictedBases_) return;
+  for (uint32_t serial : bases) solvedTarget_.erase(serial);
+  if (bases.contains(Origin())) levelTarget_.reset();
+  conflictedBases_ = std::move(bases);
+  ++revision_;
+  ++bumps_;  // Discard room solves that used observations from before the conflict.
+}
+
 const RoomBase* RoomMap::Base(uint32_t serial) const {
   const Room* room = Active();
-  if (!room) return nullptr;
+  if (!room || Conflicted(serial)) return nullptr;
   const auto found = room->bases.find(serial);
   return found == room->bases.end() ? nullptr : &found->second;
 }
@@ -439,7 +465,8 @@ const RoomBase* RoomMap::Base(uint32_t serial) const {
 std::vector<RoomBase> RoomMap::Bases() const {
   std::vector<RoomBase> out;
   if (const Room* room = Active())
-    for (const auto& [serial, base] : room->bases) out.push_back(base);
+    for (const auto& [serial, base] : room->bases)
+      if (!Conflicted(serial)) out.push_back(base);
   return out;
 }
 
@@ -450,9 +477,10 @@ bool RoomMap::Empty() const {
 
 bool RoomMap::EstablishOrigin(uint32_t serial, const std::array<double, 2>& tilt, double tiltVariance) {
   Room* room = ActiveRoom();
-  if (!room || !room->bases.empty()) return false;
+  if (!room || !room->bases.empty() || Conflicted(serial)) return false;
   RoomBase base;
   base.serial = serial;
+  keptGravity_.erase(serial);
   base.origin = true;
   base.worldFromBase = Eigen::Isometry3d::Identity();
   base.worldFromBase.linear() = Leveling(tilt[0], tilt[1], 0);
@@ -473,7 +501,7 @@ void RoomMap::Observe(const std::string& device, uint32_t primary, uint32_t alt,
                       const Eigen::Isometry3d& altFromPrimary, double positionVariance, double rotationVariance,
                       double time) {
   Room* room = ActiveRoom();
-  if (!room || primary == alt || frozen_) return;
+  if (!room || primary == alt || frozen_ || Conflicted(primary) || Conflicted(alt)) return;
   const std::string key = device + ":" + Hex(primary) + ":" + Hex(alt);
   auto last = lastObservation_.find(key);
   if (last != lastObservation_.end() && time - last->second < 0.5 && time >= last->second) return;
@@ -486,6 +514,7 @@ void RoomMap::Observe(const std::string& device, uint32_t primary, uint32_t alt,
   auto addBase = [&](uint32_t serial, const Eigen::Isometry3d& pose, double pv, double rv, uint32_t from) {
     RoomBase base;
     base.serial = serial;
+    keptGravity_.erase(serial);
     base.worldFromBase = pose;
     base.positionVariance = pv;
     base.rotationVariance = rv;
@@ -542,7 +571,7 @@ void RoomMap::Observe(const std::string& device, uint32_t primary, uint32_t alt,
       target->rotationVariance = std::max(target->rotationVariance, 0.0523599 * 0.0523599);
       target->inconsistent = 0;
       target->farSolves = 0;
-      // Still the solver's (#42): with solved cleared, the next observation from this same
+      // Still the solver's: with solved cleared, the next observation from this same
       // device blended the base half way to its view.
       relearned_.push_back(target->serial);
       Changed();
@@ -576,6 +605,11 @@ constexpr double kMoveRotFloor = 0.5 * 0.017453292519943295;
 constexpr double kMoveSigmas = 5.0;
 constexpr double kRelearnVariance = 3 * 0.02 * 0.02;    // a solve this confident re-places a bumped base
 constexpr double kBumpRad = 1.2 * 0.017453292519943295; // accelerometer turn: 2-3 counts of its 1/127
+// Against the gravity saved by an earlier session: the reference followed the base's thermal drift
+// while it ran warm, and a base just woken from standby reads cold. A 1.3 deg difference on the first
+// frames re-learned a base at every first start (back after a SteamVR restart); a base moved while
+// nothing ran turns far more.
+constexpr double kBumpSavedRad = 2.5 * 0.017453292519943295;
 }  // namespace
 
 bool RoomMap::FarOff(uint32_t serial, const Eigen::Isometry3d& pose, double pv, double rv) const {
@@ -597,25 +631,58 @@ void RoomMap::CheckAccel(uint32_t serial, const BaseDynamicState& dynamic, const
   if (dynamic.cached || up.norm() < 0.5) return;  // a recalled frame: an earlier session's gravity
   AccelTrack& a = accel_[serial];
   const Eigen::Vector3d u = up.normalized();
+  auto deg = [](double rad) { return rad * 57.29577951308232; };
   if (!a.has) {
     // Against the saved gravity first: a base moved while nothing ran is bumped on its
     // first live frames (twice running, as any bump).
     a.ref = saved ? *saved : u;
     a.has = true;
+    a.fromSaved = saved != nullptr;
     if (!saved) return;
   }
   const double angle = std::acos(std::clamp(a.ref.dot(u), -1.0, 1.0));
-  if (angle <= kBumpRad) {
+  if (angle <= (a.fromSaved ? kBumpSavedRad : kBumpRad)) {
+    if (a.fromSaved) {   // this session's own reference from here on
+      // Between kBumpRad and kBumpSavedRad a base woken cold and one moved a little look the same (a 2.0
+      // base moved 35 mm turned 1.4 deg, and nothing else caught it). Not relearned for it: loosened, so
+      // the room solver follows it if it moved, and its saved level is kept for the next session.
+      if (angle > kBumpRad) {
+        char text[200];
+        std::snprintf(text, sizeof text, "Base %08X: level %.1f deg off the saved one (woken cold, or moved a little): loosened",
+                      serial, deg(angle));
+        Log(text);
+        if (Room* room = ActiveRoom()) {
+          auto found = room->bases.find(serial);
+          if (found != room->bases.end() && !found->second.origin) Loosen(found->second);
+        }
+      } else {
+        keptGravity_.erase(serial);   // where it was saved: this session's reading goes with the room
+      }
+      a.ref = u;
+      a.fromSaved = false;
+    }
     a.strikes = 0;
     a.ref = (0.9 * a.ref + 0.1 * u).normalized();  // follows a slow (thermal) drift
     return;
   }
   if (++a.strikes < 2) return;
   a.ref = u;
+  a.fromSaved = false;
   a.strikes = 0;
   char text[160];
-  std::snprintf(text, sizeof text, "its accelerometer turned %.1f deg", angle * 57.29577951308232);
+  std::snprintf(text, sizeof text, "its accelerometer turned %.1f deg", deg(angle));
   Bump(serial, text);
+}
+
+void RoomMap::Refine(uint32_t serial, const std::string& why) {
+  Room* room = ActiveRoom();
+  if (!room || frozen_) return;
+  auto found = room->bases.find(serial);
+  if (found == room->bases.end() || found->second.origin || found->second.relearn) return;
+  Loosen(found->second);
+  char text[200];
+  std::snprintf(text, sizeof text, "Base %08X not placed well yet (%s): refining it", serial, why.c_str());
+  Log(text);
 }
 
 void RoomMap::Bump(uint32_t serial, const std::string& why) {
@@ -623,7 +690,7 @@ void RoomMap::Bump(uint32_t serial, const std::string& why) {
   if (!room || frozen_) return;
   auto found = room->bases.find(serial);
   if (found == room->bases.end()) return;
-  ++bumps_;  // a solve already running was made from keyframes before this (#42)
+  ++bumps_;  // a solve already running was made from keyframes before this
   RoomBase& b = found->second;
   if (b.origin) {
     if (!OriginGauge()) { Log("Origin base " + Hex(serial) + " knocked (" + why + "), but no other placed base to relearn it against"); return; }
@@ -672,6 +739,7 @@ void RoomMap::ApplyOriginSolved(const Eigen::Isometry3d& pose, double pv, int ke
                   serial, dp * 1000, dr * 57.29577951308232, keyframes, std::sqrt(pv / 3) * 1000);
     Log(text);
     b.worldFromBase = pose;
+    keptGravity_.erase(serial);
     originRelearn_ = false;
     ++originEpoch_;
     ++b.epoch;
@@ -687,7 +755,7 @@ void RoomMap::ApplySolved(uint32_t serial, const Eigen::Isometry3d& pose, double
   // base that really shifted a little (a 1 cm shift is half taken in a few minutes).
   constexpr double kFloorVariance = 3 * 0.001 * 0.001;
   Room* room = ActiveRoom();
-  if (!room || !pose.matrix().allFinite() || frozen_ || keyframes <= 0) return;
+  if (!room || !pose.matrix().allFinite() || frozen_ || keyframes <= 0 || Conflicted(serial)) return;
   auto found = room->bases.find(serial);
   if (found != room->bases.end() && found->second.origin) return;
   if (fresh < 0) fresh = keyframes;
@@ -759,6 +827,7 @@ void RoomMap::ApplySolved(uint32_t serial, const Eigen::Isometry3d& pose, double
     b.storedObservations = 0;  // earlier sessions' evidence is for the old place: lock again on new solves only
     b.farSolves = 0;
     b.relearn = false;
+    keptGravity_.erase(serial);  // learned where it is now: its gravity now goes with it
     ++b.epoch;
     Changed();
     return;
@@ -775,6 +844,7 @@ void RoomMap::ApplySolved(uint32_t serial, const Eigen::Isometry3d& pose, double
                   serial, dp * 1000, dr * 57.29577951308232, keyframes, rms * 1e6, std::sqrt(pv / 3) * 1000,
                   knock ? "" : "; gliding there");
     Log(text);
+    keptGravity_.erase(serial);
     if (knock) {
       b.worldFromBase = pose;
       solvedTarget_.erase(serial);
@@ -784,7 +854,7 @@ void RoomMap::ApplySolved(uint32_t serial, const Eigen::Isometry3d& pose, double
     b.positionVariance = std::max(pv, kFloorVariance);
     b.rotationVariance = std::max(rv, 1e-9);
     b.observations = keyframes;
-    b.storedObservations = 0;  // earlier sessions' evidence is for the old place (#42), as after a bump
+    b.storedObservations = 0;  // earlier sessions' evidence is for the old place, as after a bump
     b.farSolves = 0;
     ++b.epoch;
     relearned_.push_back(serial);  // keyframes from before the move are stale
@@ -850,7 +920,7 @@ void RoomMap::Advance(double time) {
 bool RoomMap::RefineOriginTilt(uint32_t serial, const std::array<double, 2>& tilt, double tiltVariance, double time) {
   constexpr double kLevelSlew = 0.05 * 0.017453292519943295, kFirstLevelSlew = 2.0 * 0.017453292519943295;  // rad/s
   Room* room = ActiveRoom();
-  if (!room || frozen_) return false;
+  if (!room || frozen_ || Conflicted(serial)) return false;
   auto found = room->bases.find(serial);
   if (found == room->bases.end() || !found->second.origin) return false;
   RoomBase& origin = found->second;
@@ -910,6 +980,7 @@ void RoomMap::ForgetAll() {
   solvedTarget_.clear();
   levelled_ = false;
   accel_.clear();
+  keptGravity_.clear();
   originRelearn_ = false;
   ++originEpoch_;
   Log("Room map forgotten; learning a new room");

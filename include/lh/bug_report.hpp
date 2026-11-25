@@ -1,7 +1,7 @@
 // One zip with everything a bug report needs, saved to the user's Documents folder:
 // a recording (SteamVR settings > openhouse > Record Session), the room and settings
 // files, SteamVR's server logs, and a summary (version, system, devices). The driver
-// saves one when Record Session is turned off; openhouse-viewer has Report > Save.
+// saves one when Record Session is turned off; openhouse-overlay has Save bug report.
 #pragma once
 #include <string>
 

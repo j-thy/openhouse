@@ -8,14 +8,20 @@ on:
   pull_request:
   workflow_dispatch:
 
-# A newer push to the same branch or pull request cancels the run still going.
+# A newer push to the same branch or pull request cancels the run still going. Manual runs
+# (release builds, signed) are never cancelled: they wait up to 2 h for approval in SignPath.
 concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
+  group: build-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 env:
+  # Release builds (the plain version, signed): only a manual run ("Run workflow") by the
+  # repository owner. Every other run builds with the commit in the version (scripts/build-*.sh).
+  RELEASE_FLAG: ${{ (github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner) && '--release' || '' }}
   # OpenVR's public headers (MIT), fetched at build time, never stored in the repo.
   OPENVR_TAG: v2.15.6
+  LIGHTHOUSE_TAG: 2.1.0
+  LIGHTHOUSE_HEADER_SHA256: 4ba763d111f90af32fa0203aa2a0ffbcc9f530155d0b9d8709ab60a0b011c023
   VCPKG_MAX_CONCURRENCY: 4
   # vcpkg's built packages (Ceres takes most of a cold build), reused between runs: see
   # the "vcpkg cache" steps. vcpkg itself is checked out at vcpkg.json's builtin-baseline,
@@ -31,13 +37,21 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build pkg-config libudev-dev libglfw3-dev libgl-dev patchelf
+          sudo apt-get install -y ninja-build pkg-config libudev-dev libglfw3-dev libgl-dev libfreetype-dev patchelf libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libwayland-dev libxkbcommon-dev wayland-protocols gcc-arm-none-eabi libnewlib-arm-none-eabi
       - name: OpenVR headers
         run: |
           git clone --depth 1 --branch "$OPENVR_TAG" https://github.com/ValveSoftware/openvr.git "$RUNNER_TEMP/openvr"
           sudo mkdir -p /usr/include/openvr /usr/share/licenses/openvr
           sudo cp "$RUNNER_TEMP"/openvr/headers/*.h /usr/include/openvr/
           sudo cp "$RUNNER_TEMP/openvr/LICENSE" /usr/share/licenses/openvr/
+      - name: Lighthouse BLE ABI header
+        run: |
+          header_dir="$RUNNER_TEMP/lighthouse-abi"
+          mkdir -p "$header_dir"
+          curl --fail --location --retry 3 -o "$header_dir/lighthouse.h" \
+            "https://github.com/ShayBox/Lighthouse/releases/download/$LIGHTHOUSE_TAG/lighthouse.h"
+          (cd "$header_dir" && echo "$LIGHTHOUSE_HEADER_SHA256  lighthouse.h" | sha256sum -c -)
+          echo "LIGHTHOUSE_INCLUDE_DIR=$header_dir" >> "$GITHUB_ENV"
       - name: vcpkg at the baseline
         run: |
           baseline=$(python3 -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")
@@ -58,7 +72,7 @@ jobs:
             vcpkg-linux-
       - run: find .vcpkg-cache -type f | sort > "$RUNNER_TEMP/vcpkg-before.txt"
       - name: Build and package
-        run: scripts/build-linux.sh
+        run: scripts/build-linux.sh $RELEASE_FLAG
       - name: vcpkg cache (anything new?)
         id: vcpkg-new
         if: always()
@@ -75,18 +89,20 @@ jobs:
         run: ctest --test-dir build-release --output-on-failure
       - uses: actions/upload-artifact@v4
         with:
-          name: openhouse-driver-linux
-          path: dist/openhouse-driver-linux.tar.gz
+          name: openhouse-linux-x64
+          path: dist/openhouse-linux-x64.tar.gz
           if-no-files-found: error
 
   windows:
     runs-on: ubuntu-24.04
+    outputs:
+      unsigned-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build pkg-config mingw-w64
+          sudo apt-get install -y ninja-build pkg-config mingw-w64 gcc-arm-none-eabi libnewlib-arm-none-eabi
           # std::thread needs MinGW's posix thread model (Ubuntu defaults to win32).
           sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
           sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
@@ -96,6 +112,14 @@ jobs:
           sudo mkdir -p /usr/include/openvr /usr/share/licenses/openvr
           sudo cp "$RUNNER_TEMP"/openvr/headers/*.h /usr/include/openvr/
           sudo cp "$RUNNER_TEMP/openvr/LICENSE" /usr/share/licenses/openvr/
+      - name: Lighthouse BLE ABI header
+        run: |
+          header_dir="$RUNNER_TEMP/lighthouse-abi"
+          mkdir -p "$header_dir"
+          curl --fail --location --retry 3 -o "$header_dir/lighthouse.h" \
+            "https://github.com/ShayBox/Lighthouse/releases/download/$LIGHTHOUSE_TAG/lighthouse.h"
+          (cd "$header_dir" && echo "$LIGHTHOUSE_HEADER_SHA256  lighthouse.h" | sha256sum -c -)
+          echo "LIGHTHOUSE_INCLUDE_DIR=$header_dir" >> "$GITHUB_ENV"
       - name: vcpkg at the baseline
         run: |
           baseline=$(python3 -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")
@@ -116,7 +140,7 @@ jobs:
             vcpkg-mingw-
       - run: find .vcpkg-cache -type f | sort > "$RUNNER_TEMP/vcpkg-before.txt"
       - name: Build and package
-        run: scripts/build-windows.sh
+        run: scripts/build-windows.sh $RELEASE_FLAG
       - name: vcpkg cache (anything new?)
         id: vcpkg-new
         if: always()
@@ -129,10 +153,60 @@ jobs:
         with:
           path: .vcpkg-cache
           key: vcpkg-mingw-${{ hashFiles('vcpkg.json', 'cmake/triplets/*') }}-${{ github.run_id }}
-      - uses: actions/upload-artifact@v4
+      # The unsigned package, also what SignPath signs (.signpath/artifact-configuration.xml:
+      # GitHub stores it as a ZIP holding openhouse-windows-x64.zip).
+      - name: Upload the package
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
         with:
           name: openhouse-windows-x64
           path: dist/openhouse-windows-x64.zip
+          if-no-files-found: error
+      # Unstripped binaries for reading crash records (common/crash_log.hpp); not part of a release.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openhouse-windows-x64-symbols
+          path: dist/openhouse-windows-x64-symbols.zip
+          retention-days: 90
+
+  # Code signing through SignPath (signpath.io), for release builds only: a manual run ("Run
+  # workflow") by the repository owner, which builds with --release. Pushes, tags, pull
+  # requests (forks have no secrets) and anyone else's runs stay unsigned, with the commit in
+  # their version. Every signing waits for manual approval. Needs the repository secret SIGNPATH_API_TOKEN and the repository variables
+  # SIGNPATH_ORGANIZATION_ID, SIGNPATH_PROJECT_SLUG, SIGNPATH_SIGNING_POLICY_SLUG (the
+  # test-signing policy until the production certificate is in, then the release one) and
+  # SIGNPATH_ARTIFACT_CONFIGURATION_SLUG.
+  windows-signed:
+    needs: windows
+    if: >-
+      github.repository == 'YusufOzmen01/openhouse' &&
+      github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Sign with SignPath
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          # Which certificate signs (the signing policy) and which files (the artifact
+          # configuration, .signpath/artifact-configuration.xml): two different SignPath slugs.
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ needs.windows.outputs.unsigned-artifact-id }}
+          wait-for-completion: true
+          # Each signing waits for manual approval in SignPath (a release policy rule): up
+          # to 2 h, then the job fails and the request can still be approved and re-run.
+          wait-for-completion-timeout-in-seconds: 7200
+          # Unpacked: the package zip itself, its binaries signed inside.
+          output-artifact-directory: signed
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openhouse-windows-x64-signed
+          path: signed/openhouse-windows-x64.zip
           if-no-files-found: error
 
   firmware:
@@ -143,10 +217,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
-      - name: Build, host test and package
+      # The packages carry the images (scripts/stage-firmwares.py); this checks lhbs on the host.
+      - name: Build and host test
         run: scripts/build-firmware.sh
-      - uses: actions/upload-artifact@v4
-        with:
-          name: openhouse-basestation-firmware
-          path: dist/openhouse-basestation-firmware.zip
-          if-no-files-found: error

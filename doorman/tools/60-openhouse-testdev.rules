@@ -1,0 +1,3 @@
+# Pro Micro test devices (radio-fw TARGET=fake, tools/testdev.py): hidraw access for the logged-in user.
+# sudo cp 60-openhouse-testdev.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+KERNEL=="hidraw*", ATTRS{idVendor}=="6767", ATTRS{idProduct}=="0728", MODE="0660", TAG+="uaccess"

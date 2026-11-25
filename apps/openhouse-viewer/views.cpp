@@ -26,6 +26,7 @@ std::string BaseLabel(const State& s, const std::string& serial) {
 }
 
 std::string DeviceName(const Device& d) {
+  if (!d.name.empty()) return d.name;
   std::string kind = d.role == "hmd" ? "Headset" : d.role == "controller" ? "Controller" : "Tracker";
   if (d.hand == "left_hand") kind += " (left)";
   else if (d.hand == "right_hand") kind += " (right)";

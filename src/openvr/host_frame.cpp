@@ -38,7 +38,7 @@ Eigen::Isometry3d LevelPin(const Eigen::Isometry3d& anchor, const Eigen::Isometr
 void HostFrame::Load(const std::string& path) {
   path_ = path;
   anchors_.clear();
-  std::ifstream f(path);
+  std::ifstream f(lh::platform::FsPath(path));
   if (!f) return;
   try {
     const auto j = nlohmann::json::parse(f);
@@ -49,6 +49,12 @@ void HostFrame::Load(const std::string& path) {
       const auto p = a.at("position").get<std::array<double, 3>>();
       anchor.pose.linear() = Eigen::Quaterniond(q[0], q[1], q[2], q[3]).normalized().toRotationMatrix();
       anchor.pose.translation() = Eigen::Vector3d(p[0], p[1], p[2]);
+      if (const auto c = a.find("calibration"); c != a.end() && c->is_object()) {
+        const double yaw = c->value("yaw", 0.0) * 0.017453292519943295;
+        anchor.calibration.linear() = Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitY()).toRotationMatrix();
+        const auto t = c->value("translation", std::array<double, 3>{0, 0, 0});
+        anchor.calibration.translation() = Eigen::Vector3d(t[0], t[1], t[2]);
+      }
       anchors_[room] = anchor;
     }
   } catch (...) {
@@ -65,15 +71,21 @@ void HostFrame::Save() const {
     const Eigen::Quaterniond q(a.pose.rotation());
     const Eigen::Vector3d t = a.pose.translation();
     j["rooms"][room] = {{"base", a.base}, {"orientation", {q.w(), q.x(), q.y(), q.z()}}, {"position", {t.x(), t.y(), t.z()}}};
+    if (!a.calibration.isApprox(Eigen::Isometry3d::Identity())) {
+      const Eigen::Matrix3d r = a.calibration.rotation();
+      const double yaw = std::atan2(r(0, 2), r(0, 0)) * 57.29577951308232;
+      const Eigen::Vector3d c = a.calibration.translation();
+      j["rooms"][room]["calibration"] = {{"yaw", yaw}, {"translation", {c.x(), c.y(), c.z()}}};
+    }
   }
   const std::string tmp = path_ + ".tmp";
   {
-    std::ofstream f(tmp);
+    std::ofstream f(lh::platform::FsPath(tmp));
     f << j.dump(1);
     f.close();
     if (!f) return;
   }
-  // std::rename doesn't replace an existing file on Windows: only the first save took (#43).
+  // std::rename doesn't replace an existing file on Windows: only the first save took.
   try {
     lh::platform::ReplaceFile(tmp, path_);
   } catch (const std::exception&) {
@@ -89,6 +101,7 @@ const Eigen::Isometry3d& HostFrame::Update(const SessionSnapshot& snapshot, doub
     anchored_ = false;
     stillPose_.reset();
     rawFromWorld_.setIdentity();
+    pinned_.setIdentity();
     return rawFromWorld_;
   }
   const Eigen::Isometry3d worldFromOrigin = FromPose(origin->worldFromBase);
@@ -102,6 +115,7 @@ const Eigen::Isometry3d& HostFrame::Update(const SessionSnapshot& snapshot, doub
     if (!still) { stillPose_ = worldFromOrigin; stillSince_ = now; }
     anchored_ = false;
     rawFromWorld_.setIdentity();
+    pinned_.setIdentity();
     if (now - stillSince_ < kStillTime) return rawFromWorld_;
     found = anchors_.insert_or_assign(snapshot.roomId, Anchor{origin->serial, worldFromOrigin}).first;
     Save();
@@ -109,14 +123,33 @@ const Eigen::Isometry3d& HostFrame::Update(const SessionSnapshot& snapshot, doub
   if (anchored_ && snapshot.originEpoch != originEpoch_ && snapshot.roomId == lastRoom_) {
     // The origin was knocked and the room re-placed it: the room (and the devices in
     // it) didn't move, so neither does the host frame; the anchor follows the origin.
-    found->second.pose = rawFromWorld_ * worldFromOrigin;
+    found->second.pose = pinned_ * worldFromOrigin;
     Save();
   }
   originEpoch_ = snapshot.originEpoch;
   lastRoom_ = snapshot.roomId;
   anchored_ = true;
-  rawFromWorld_ = LevelPin(found->second.pose, worldFromOrigin);
+  pinned_ = LevelPin(found->second.pose, worldFromOrigin);
+  rawFromWorld_ = found->second.calibration * pinned_;
   return rawFromWorld_;
+}
+
+Eigen::Isometry3d HostFrame::Calibration() const {
+  const auto found = anchors_.find(lastRoom_);
+  return anchored_ && found != anchors_.end() ? found->second.calibration : Eigen::Isometry3d::Identity();
+}
+
+bool HostFrame::SetCalibration(const Eigen::Isometry3d& calibration) {
+  const auto found = anchors_.find(lastRoom_);
+  if (!anchored_ || found == anchors_.end()) return false;
+  // Only a turn about the vertical and a shift: a level room stays level.
+  const Eigen::Matrix3d r = calibration.rotation();
+  const double yaw = std::atan2(r(0, 2), r(0, 0));
+  found->second.calibration.linear() = Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitY()).toRotationMatrix();
+  found->second.calibration.translation() = calibration.translation();
+  rawFromWorld_ = found->second.calibration * pinned_;
+  Save();
+  return true;
 }
 
 }  // namespace lh::openvr

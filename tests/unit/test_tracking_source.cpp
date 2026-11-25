@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include "../common/ootx_frame.hpp"
+
 #include "tracking/tracking_source.hpp"
 
 TEST(TrackingSource, PreservesTimeFlagsAndOriginalFloatPrecision) {
@@ -63,34 +65,7 @@ TEST(TrackingSource, DeviceQueuesAreIndependent) {
 
 #include "tracking/ootx.hpp"
 
-namespace {
-// The lhbs firmware's OOTX encoder (basestation_firmware/src/ootx.c): 17 zeros, a 1, then
-// u16 length, payload, pad, crc32, each byte MSB first, a 1 stuffed after 16 bits.
-std::vector<uint8_t> LhbsFrame(const std::vector<uint8_t>& payload) {
-  std::vector<uint8_t> bits(17, 0);
-  bits.push_back(1);
-  auto bit = [&](int b) {
-    bits.push_back(uint8_t(b));
-    if (bits.size() > 18 && bits.size() % 17 == 0) bits.push_back(1);
-  };
-  auto bytes = [&](const uint8_t* p, size_t n) {
-    for (size_t i = 0; i < n; ++i)
-      for (int k = 7; k >= 0; --k) bit((p[i] >> k) & 1);
-  };
-  const uint8_t len[2] = {uint8_t(payload.size()), 0};
-  bytes(len, 2);
-  bytes(payload.data(), payload.size());
-  if (payload.size() & 1) { const uint8_t z = 0; bytes(&z, 1); }
-  uint32_t crc = ~0u;
-  for (uint8_t c : payload) {
-    crc ^= c;
-    for (int k = 0; k < 8; ++k) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1)));
-  }
-  crc = ~crc;
-  bytes(reinterpret_cast<const uint8_t*>(&crc), 4);
-  return bits;
-}
-}  // namespace
+using lh::test::LhbsFrame;
 
 // lhbs multi mode adds the round (which slots take turns) as payload byte 33.
 TEST(Ootx, DecodesTheLhbsMultiRound) {
@@ -126,4 +101,35 @@ TEST(Ootx, DecodesTheLhbsMultiRound) {
   lh::ootx::OotxMajorityRing r3(int(bogus.size()));
   for (uint8_t b : bogus) r3.Push(b);
   EXPECT_FALSE(lh::ootx::DecodeRing(r3, &cfg, &dyn));
+}
+
+TEST(Ootx, BlockedSobChannelKeepsIntactFramesWithoutCombiningRevolutions) {
+  std::vector<uint8_t> payload(43, 0);
+  payload[0] = 8;
+  payload[2] = 0x42;
+  payload[15] = 0x0b;
+  const auto bits = LhbsFrame(payload);
+  ASSERT_EQ(bits.size(), 443u);
+  lh::sob::SobDisambiguator blocked, clear;
+  blocked.SetKnownChannels({}, std::bitset<lh::sob::kChannels>{1});
+  const double period = lh::sob::kPeriodTicks[0] * lh::sob::kTickSeconds;
+  size_t rev = 0;
+  for (size_t lap = 0; lap < 2; ++lap) {
+    for (size_t bit = 0; bit < bits.size(); ++bit, ++rev) {
+      if (bit == 120 + lap) continue;
+      clear.OnBeamWord(1.0 + rev * period, 0, bits[bit], 0);
+      blocked.OnBeamWord(1.0 + rev * period, 0, bits[bit], 0);
+    }
+  }
+  lh::BaseConfig config;
+  lh::BaseDynamicState dynamic;
+  ASSERT_TRUE(clear.PopBaseConfig(&config, &dynamic));
+  EXPECT_EQ(config.serial, 0x42u);
+  EXPECT_FALSE(blocked.PopBaseConfig(&config, &dynamic));
+
+  for (const auto bit : bits) blocked.OnBeamWord(1.0 + rev++ * period, 0, bit, 0);
+  ASSERT_TRUE(blocked.PopBaseConfig(&config, &dynamic));
+  EXPECT_EQ(config.serial, 0x42u);
+  EXPECT_FALSE(dynamic.cached);
+  EXPECT_EQ(blocked.ChannelSerial(0), 0u);
 }

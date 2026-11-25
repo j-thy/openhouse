@@ -1,5 +1,7 @@
 # Watchman wireless protocol (dongles 28de:2101 / 28de:2102)
 
+openhouse's own dongle (6767:0727) is a different protocol: `../doorman/protocol.md`.
+
 Port: `src/transport/usb/wireless_decoder.{hpp,cpp}`, `WirelessReportParser` in
 `report_parser.cpp`, handshake in `usb_transport.cpp`.
 Status: **bit-exact** vs the original decoders (`tests/oracle/test_wireless_diff.cpp`):

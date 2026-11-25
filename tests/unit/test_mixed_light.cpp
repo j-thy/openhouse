@@ -557,6 +557,23 @@ TEST(LightMode, OneKindSeenKeepsThatMode) {
   EXPECT_EQ(ChooseLightMode(v).mode, 0) << "re-sent now and then";
 }
 
+TEST(LightMode, KnownRoomIsOnlyAStartingGuess) {
+  // SteamVR's database lists 2.0 bases only (an earlier setup); the room really has 1.0 bases.
+  LightModeView v;
+  v.knownLh2 = true;
+  EXPECT_EQ(ChooseLightMode(v).mode, 1) << "starts in LH2";
+  v.mode = 1; v.dark = v.inMode = 5;
+  EXPECT_NE(ChooseLightMode(v).mode, 0) << "dark a few seconds: still the known room's mode (or it re-sent)";
+  v.dark = v.inMode = 15;
+  EXPECT_EQ(ChooseLightMode(v).mode, 0) << "dark in LH2 that long: try LH1";
+  v.mode = 0; v.dark = v.inMode = 5;
+  EXPECT_NE(ChooseLightMode(v).mode, 1) << "LH1 gets its time to find a station";
+  v.dark = v.inMode = 10;
+  EXPECT_EQ(ChooseLightMode(v).mode, 1) << "nothing in LH1 either: back to the known mode";
+  v.dark = 0; v.inMode = 30;
+  EXPECT_NE(ChooseLightMode(v).mode, 1) << "light in LH1: it stays";
+}
+
 TEST(Lh1Keyframes, AlwaysWithout2Point0Light) {
   lh::runtime::Lh1KeyframeView v;  // a 1.0-only room: no beam word from anyone, ever
   EXPECT_TRUE(lh::runtime::Lh1KeyframesUsable(v));

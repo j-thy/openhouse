@@ -1,0 +1,4 @@
+tinyusb 0.17.0 (5217cee5de4cd555018da90f9f1bcc87fb1c1d3a) https://github.com/hathach/tinyusb
+nrfx v2.11.0 (2527e3c8449cfd38aee41598e8af8492f410ed15) https://github.com/NordicSemiconductor/nrfx
+CMSIS_5 5.9.0 (2b7495b8535bdcb306dac29b9ded4cfb679d7e5c) https://github.com/ARM-software/CMSIS_5
+Only the files the doorman builds use are kept (see ai/doorman/README.md).

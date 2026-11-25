@@ -133,6 +133,41 @@ struct Trail {
   std::deque<Eigen::Vector3d> points;
 };
 
+// Receivers panel: one row per Watchman dongle and per Doorman Dongle slot, with live link stats.
+struct ReceiverHistory {
+  std::deque<float> kbps;   // one sample per refresh, for the sparkline
+};
+
+void Badge(const char* text, ImVec4 color) {
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const ImVec2 sz = ImGui::CalcTextSize(text);
+  const ImVec2 p = ImGui::GetCursorScreenPos();
+  const ImVec2 q(p.x + sz.x + 10, p.y + sz.y + 2);
+  dl->AddRectFilled(p, q, ImGui::ColorConvertFloat4ToU32(ImVec4(color.x, color.y, color.z, 0.25f)), 4);
+  dl->AddRect(p, q, ImGui::ColorConvertFloat4ToU32(color), 4);
+  dl->AddText(ImVec2(p.x + 5, p.y + 1), ImGui::ColorConvertFloat4ToU32(color), text);
+  ImGui::Dummy(ImVec2(sz.x + 10, sz.y + 2));
+}
+
+void Dot(bool on, bool warn = false) {
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const ImVec2 p = ImGui::GetCursorScreenPos();
+  const float h = ImGui::GetTextLineHeight();
+  const ImU32 c = !on ? IM_COL32(110, 110, 110, 255) : warn ? IM_COL32(240, 190, 60, 255) : IM_COL32(80, 230, 110, 255);
+  dl->AddCircleFilled(ImVec2(p.x + h * 0.5f, p.y + h * 0.5f + 1), h * 0.3f, c);
+  ImGui::Dummy(ImVec2(h, h));
+}
+
+ImVec4 LossColor(double loss) {
+  if (loss < 0) return ImVec4(0.6f, 0.6f, 0.6f, 1);
+  return loss < 3 ? ImVec4(0.4f, 0.9f, 0.5f, 1) : loss < 10 ? ImVec4(0.95f, 0.8f, 0.3f, 1) : ImVec4(1, 0.4f, 0.35f, 1);
+}
+
+ImVec4 RssiColor(int rssi) {
+  if (!rssi) return ImVec4(0.6f, 0.6f, 0.6f, 1);
+  return rssi > -65 ? ImVec4(0.4f, 0.9f, 0.5f, 1) : rssi > -78 ? ImVec4(0.95f, 0.8f, 0.3f, 1) : ImVec4(1, 0.4f, 0.35f, 1);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -188,6 +223,9 @@ int main(int argc, char** argv) {
   float floorHeight = -2.6f;
   bool floorAuto = true;
   double lastTrailTime = 0;
+  std::vector<lh::Session::Receiver> receivers;
+  std::map<std::string, ReceiverHistory> receiverHistory;
+  double lastReceiverPoll = -1;
 
   while (!glfwWindowShouldClose(window)) {
     glfwPollEvents();
@@ -513,9 +551,99 @@ int main(int argc, char** argv) {
     }
     ImGui::End();
 
+    // Receivers: Watchman dongles and each Doorman Dongle slot, alike.
+    if (options.replayPath.empty() && glfwGetTime() - lastReceiverPoll >= 0.5) {
+      lastReceiverPoll = glfwGetTime();
+      receivers = session->Receivers();
+      std::stable_sort(receivers.begin(), receivers.end(), [](const auto& a, const auto& b) {
+        return a.kind != b.kind ? a.kind == "openhouse" : a.serial < b.serial;
+      });
+      for (const auto& r : receivers) {
+        auto& h = receiverHistory[r.serial].kbps;
+        h.push_back(float(r.kBytesPerSec));
+        while (h.size() > 60) h.pop_front();
+      }
+    }
+    ImGui::SetNextWindowPos(ImVec2(float(fw) - 640, 580), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(630, float(fh) - 590), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Receivers");
+    {
+      int oh = 0, wm = 0, ohJoined = 0; double total = 0;
+      for (const auto& r : receivers) {
+        (r.kind == "openhouse" ? oh : wm)++;
+        if (r.kind == "openhouse") ohJoined = r.devicesOnDongle;
+        total += r.kBytesPerSec;
+      }
+      if (!options.replayPath.empty()) ImGui::TextDisabled("replay: no receivers");
+      else if (receivers.empty()) ImGui::TextDisabled("no dongles plugged in");
+      else {
+        ImGui::Text("%d Watchman", wm);
+        ImGui::SameLine(); ImGui::TextDisabled("|");
+        ImGui::SameLine(); ImGui::Text("openhouse: %d slot%s, %d joined", oh, oh == 1 ? "" : "s", ohJoined);
+        ImGui::SameLine(); ImGui::TextDisabled("|");
+        ImGui::SameLine(); ImGui::Text("%.1f kB/s total", total);
+      }
+    }
+    if (!receivers.empty() &&
+        ImGui::BeginTable("receivers", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_SizingFixedFit |
+                                          ImGuiTableFlags_PadOuterX)) {
+      ImGui::TableSetupColumn("receiver"); ImGui::TableSetupColumn("device");
+      ImGui::TableSetupColumn("throughput", ImGuiTableColumnFlags_WidthStretch);
+      ImGui::TableSetupColumn("frames/s"); ImGui::TableSetupColumn("loss"); ImGui::TableSetupColumn("rssi d/t");
+      ImGui::TableHeadersRow();
+      for (const auto& r : receivers) {
+        const bool ohd = r.kind == "openhouse";
+        ImGui::TableNextRow(ImGuiTableRowFlags_None, 30);
+        ImGui::TableNextColumn();
+        Dot(r.linked, ohd && (r.lossPercent >= 10 || r.dropsPerSec > 0));
+        ImGui::SameLine();
+        Badge(ohd ? "OH" : "WM", ohd ? ImVec4(0.45f, 0.75f, 1, 1) : ImVec4(0.8f, 0.6f, 1, 1));
+        ImGui::SameLine();
+        if (ohd) {
+          const auto cut = r.serial.find('/');
+          ImGui::Text("%s", r.serial.substr(0, cut).c_str());
+          ImGui::SameLine(0, 2); ImGui::TextDisabled("slot %d", r.slot);
+        } else {
+          ImGui::Text("%s", r.serial.c_str());
+        }
+        ImGui::TableNextColumn();
+        if (!r.connected.empty()) ImGui::Text("%s", r.connected.c_str());
+        else ImGui::TextDisabled(!r.paired ? "empty slot" : r.linked ? "identifying..." : "off");
+        ImGui::TableNextColumn();
+        {
+          const auto& h = receiverHistory[r.serial].kbps;
+          std::vector<float> v(h.begin(), h.end());
+          float peak = 4;
+          for (float x : v) peak = std::max(peak, x * 1.2f);
+          char label[32];
+          std::snprintf(label, sizeof label, "%.1f kB/s", r.kBytesPerSec);
+          ImGui::PushStyleColor(ImGuiCol_PlotLines, ohd ? ImVec4(0.45f, 0.75f, 1, 1) : ImVec4(0.8f, 0.6f, 1, 1));
+          ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.1f, 0.1f, 0.13f, 1));
+          ImGui::PlotLines("##kbps", v.empty() ? nullptr : v.data(), int(v.size()), 0, label, 0, peak,
+                           ImVec2(std::max(120.0f, ImGui::GetContentRegionAvail().x), 26));
+          ImGui::PopStyleColor(2);
+        }
+        ImGui::TableNextColumn();
+        if (r.linked) ImGui::Text("%.0f", r.framesPerSec); else ImGui::TextDisabled("-");
+        ImGui::TableNextColumn();
+        if (r.linked && r.lossPercent >= 0) {
+          ImGui::TextColored(LossColor(r.lossPercent), "%.1f%%", r.lossPercent);
+          if (r.dropsPerSec > 0) { ImGui::SameLine(); ImGui::TextColored(ImVec4(1, 0.4f, 0.35f, 1), "drop %.0f/s", r.dropsPerSec); }
+        } else ImGui::TextDisabled("-");
+        ImGui::TableNextColumn();
+        if (r.linked && (r.rssiDongle || r.rssiDevice)) {
+          ImGui::TextColored(RssiColor(r.rssiDongle), "%d", r.rssiDongle);
+          ImGui::SameLine(0, 3); ImGui::TextDisabled("/");
+          ImGui::SameLine(0, 3); ImGui::TextColored(RssiColor(r.rssiDevice), "%d", r.rssiDevice);
+        } else ImGui::TextDisabled("-");
+      }
+      ImGui::EndTable();
+    }
+    ImGui::End();
+
     // Events.
     ImGui::SetNextWindowPos(ImVec2(10, float(fh) - 250), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(900, 240), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(std::min(900.0f, float(fw) - 670), 240), ImGuiCond_FirstUseEver);
     ImGui::Begin("Events");
     ImGui::Checkbox("auto-scroll", &autoScroll);
     ImGui::SameLine();

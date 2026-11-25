@@ -39,7 +39,13 @@ bool ControllerInputDecoder::Apply(const InputReport& r, double hostTime) {
       s.menuClick = r.buttons & 0x20;
     }
     if (r.hasTrigger) s.trigger = r.trigger / 255.0;
-    if (r.hasAxes) { s.trackpadX = r.axisX / 32768.0; s.trackpadY = r.axisY / 32768.0; }
+    // A click is a touch too. Letting go, the touch bit can drop a report or two before
+    // the click's: zeroed there, the pad would read as a click at its very centre, which
+    // a binding split into regions takes as another button. The last position is kept
+    // while it's pressed.
+    const bool touched = s.trackpadTouch;
+    if (s.trackpadClick) s.trackpadTouch = true;
+    if (r.hasAxes && touched) { s.trackpadX = r.axisX / 32768.0; s.trackpadY = r.axisY / 32768.0; }
     if (!s.trackpadTouch) s.trackpadX = s.trackpadY = 0;
     s.hostTime = hostTime;
     return !SameInput(before, s);
